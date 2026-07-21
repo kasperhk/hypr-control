@@ -5,13 +5,17 @@ import unittest
 
 from hypr_control_center.config_engine import (
     atomic_write,
+    backup_history,
     get_value,
+    idle_timeouts,
     listener_timeout,
     parse_bindings,
     remove_listener,
     restore_backup,
     set_listener_timeout,
     set_value,
+    shortcut_chord,
+    transactional_write,
 )
 
 
@@ -60,6 +64,19 @@ class ConfigEngineTests(unittest.TestCase):
         self.assertEqual(item["key"], "X")
         self.assertEqual(item["argument"], "app --value=a,b")
 
+    def test_shortcut_chords_normalize_aliases_and_order(self):
+        self.assertEqual(
+            shortcut_chord("shift control super", "x"),
+            shortcut_chord("SUPER CTRL SHIFT", "X"),
+        )
+
+    def test_idle_timeouts_make_lock_relative_to_screensaver(self):
+        self.assertEqual(idle_timeouts(5, 2, 30), (300, 420, 1800))
+
+    def test_idle_timeouts_reject_suspend_before_lock(self):
+        with self.assertRaises(ValueError):
+            idle_timeouts(10, 5, 12)
+
     def test_atomic_write_keeps_backup(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "input.conf"
@@ -83,6 +100,44 @@ class ConfigEngineTests(unittest.TestCase):
             self.assertIsNone(backup)
             restore_backup(path, backup)
             self.assertFalse(path.exists())
+
+    def test_transaction_rolls_back_every_file_when_validation_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.conf"
+            second = Path(directory) / "second.conf"
+            first.write_text("before first\n", encoding="utf-8")
+            second.write_text("before second\n", encoding="utf-8")
+            ok, message, _ = transactional_write(
+                {first: "after first\n", second: "after second\n"},
+                lambda: (False, "bad configuration"),
+            )
+            self.assertFalse(ok)
+            self.assertEqual(message, "bad configuration")
+            self.assertEqual(first.read_text(encoding="utf-8"), "before first\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "before second\n")
+
+    def test_transaction_rolls_back_files_when_a_later_write_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            first = Path(directory) / "first.conf"
+            first.write_text("before\n", encoding="utf-8")
+            invalid = Path(directory) / "folder"
+            invalid.mkdir()
+            ok, _message, _ = transactional_write(
+                {first: "after\n", invalid: "cannot replace a directory\n"},
+                lambda: (True, ""),
+            )
+            self.assertFalse(ok)
+            self.assertEqual(first.read_text(encoding="utf-8"), "before\n")
+
+    def test_backup_history_is_newest_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "input.conf"
+            path.write_text("zero\n", encoding="utf-8")
+            atomic_write(path, "one\n")
+            atomic_write(path, "two\n")
+            history = backup_history(path)
+            self.assertEqual(len(history), 2)
+            self.assertGreater(history[0].name, history[1].name)
 
 
 if __name__ == "__main__":

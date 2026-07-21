@@ -16,6 +16,13 @@ Hypr Control is a native GTK 4/libadwaita control center for Hyprland on [Omarch
 - Display layout handoff to `nwg-displays`
 - Raw editor for user-owned Hyprland configuration files
 - Automatic timestamped backups, `hyprctl configerrors` validation, and rollback
+- Transactional multi-file saves with complete rollback on write or validation failure
+- Protection against overwriting configuration changed by another application
+- Search across setting names, descriptions, and Hyprland keys (`Ctrl+K`)
+- A persistent pending-change bar with Apply and Discard actions
+- Coordinated appearance presets and a chronological idle timeline
+- Direct shortcut capture with normalized conflict detection
+- Raw-editor diffs plus browsable, restorable configuration history
 
 ## Requirements
 
@@ -57,7 +64,9 @@ PREFIX="$HOME/.local" ./install.sh
 
 ## Safety model
 
-Before changing an existing file, Hypr Control creates a uniquely timestamped sibling backup named `*.bak.hypr-control-*`. Hyprland changes are reloaded and checked with `hyprctl configerrors`. Rejected changes are restored automatically; newly created files are removed on rollback. Idle-service changes are validated by restarting the corresponding Omarchy service.
+Before changing an existing file, Hypr Control creates a uniquely timestamped sibling backup named `*.bak.hypr-control-*`. A group of pending changes is treated as one transaction: Hyprland is reloaded, `hyprctl configerrors` is checked, and affected Omarchy services are restarted. If any write or validation step fails, every touched file is restored. Newly created files are removed on rollback. The newest 20 backups per file remain available from the Advanced page.
+
+Hypr Control also records the user-owned file contents it loaded. If another application changes one of those files while settings are pending, applying stops instead of silently overwriting the external change.
 
 The display layout editor is deliberately delegated to `nwg-displays`, which owns the generated monitor and workspace files on Omarchy.
 

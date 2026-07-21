@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from collections.abc import Callable, Mapping
 import os
 import re
 import shutil
@@ -12,6 +13,8 @@ import tempfile
 
 BLOCK_RE = re.compile(r"^\s*([\w.-]+)\s*\{\s*(?:#.*)?$")
 ASSIGN_RE = re.compile(r"^(\s*)([\w.:-]+)\s*=\s*(.*?)(\s+#.*)?$")
+MODIFIER_ALIASES = {"CONTROL": "CTRL", "MOD1": "ALT", "MOD4": "SUPER", "WIN": "SUPER"}
+MODIFIER_ORDER = {"SUPER": 0, "CTRL": 1, "ALT": 2, "SHIFT": 3}
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,33 @@ def parse_bindings(text: str) -> list[dict[str, str | int]]:
     return result
 
 
+def shortcut_chord(modifiers: str, key: str) -> tuple[tuple[str, ...], str]:
+    """Return a stable representation for shortcut conflict comparisons."""
+    normalized = {
+        MODIFIER_ALIASES.get(item.upper(), item.upper())
+        for item in re.split(r"[ +]+", modifiers.strip())
+        if item
+    }
+    ordered = tuple(sorted(normalized, key=lambda item: (MODIFIER_ORDER.get(item, 99), item)))
+    return ordered, key.strip().upper()
+
+
+def idle_timeouts(
+    screensaver_minutes: float,
+    lock_after_minutes: float,
+    suspend_minutes: float | None,
+) -> tuple[int, int, int | None]:
+    """Convert the friendly sequential idle model to absolute Hypridle seconds."""
+    screensaver = round(screensaver_minutes * 60)
+    lock = screensaver + round(lock_after_minutes * 60)
+    suspend = None if suspend_minutes is None else round(suspend_minutes * 60)
+    if screensaver < 0 or lock < screensaver:
+        raise ValueError("Idle delays cannot be negative")
+    if suspend is not None and suspend <= lock:
+        raise ValueError("Suspend must occur after lock")
+    return screensaver, lock, suspend
+
+
 def atomic_write(path: Path, text: str) -> Path | None:
     path.parent.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -240,3 +270,47 @@ def restore_backup(path: Path, backup: Path | None) -> None:
         path.unlink(missing_ok=True)
     else:
         shutil.copy2(backup, path)
+
+
+def backup_history(path: Path, limit: int = 20) -> list[Path]:
+    """Return the newest Hypr Control backups for *path*."""
+    pattern = f"{path.name}.bak.hypr-control-*"
+    return sorted(path.parent.glob(pattern), key=lambda item: item.name, reverse=True)[:limit]
+
+
+def prune_backups(path: Path, keep: int = 20) -> None:
+    """Bound automatic backup growth without touching unrelated backups."""
+    for backup in backup_history(path, limit=10_000)[keep:]:
+        backup.unlink(missing_ok=True)
+
+
+def transactional_write(
+    changes: Mapping[Path, str],
+    validate: Callable[[], tuple[bool, str]],
+    *,
+    keep_backups: int = 20,
+) -> tuple[bool, str, dict[Path, Path | None]]:
+    """Write and validate a set of files as one reversible operation.
+
+    Files must temporarily exist for Hyprland and service validators to inspect
+    them. Any write or validation failure restores every file already touched.
+    Successful backups are retained for user-facing recovery.
+    """
+    backups: dict[Path, Path | None] = {}
+    try:
+        for path, text in changes.items():
+            backups[path] = atomic_write(path, text)
+        ok, message = validate()
+        if not ok:
+            raise ValueError(message or "Configuration validation failed")
+    except Exception as error:
+        for path, backup in reversed(tuple(backups.items())):
+            try:
+                restore_backup(path, backup)
+            except OSError:
+                pass
+        return False, str(error), backups
+
+    for path in changes:
+        prune_backups(path, keep_backups)
+    return True, "", backups

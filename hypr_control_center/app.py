@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import difflib
 import json
 import os
 import re
@@ -17,14 +18,16 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from .config_engine import (
-    atomic_write,
+    backup_history,
     get_value,
+    idle_timeouts,
     listener_timeout,
     parse_bindings,
     remove_listener,
-    restore_backup,
     set_listener_timeout,
     set_value,
+    shortcut_chord,
+    transactional_write,
 )
 
 
@@ -44,6 +47,8 @@ class Binding:
     widget: Gtk.Widget
     kind: str
     values: list[str] | None = None
+    original: str = ""
+    page: str = ""
 
     def serialize(self) -> str:
         if self.kind == "spin":
@@ -76,6 +81,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.set_size_request(760, 560)
 
         self.loading = True
+        self.saving = False
         self.setting_bindings: list[Binding] = []
         self.dirty_bindings: set[int] = set()
         self.shortcut_additions: list[str] = []
@@ -83,6 +89,12 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.advanced_dirty = False
         self.advanced_current = "hyprland.conf"
         self._advanced_switching = False
+        self._idle_dirty = False
+        self._idle_original: tuple[float, float, bool, float] | None = None
+        self.file_snapshots: dict[Path, str | None] = {}
+        self.recent_change = "No changes applied in this session"
+        self._building_page = "home"
+        self.connect("close-request", self._close_requested)
 
         self.toast_overlay = Adw.ToastOverlay()
         self.set_content(self.toast_overlay)
@@ -96,12 +108,10 @@ class HyprControlWindow(Adw.ApplicationWindow):
         navigation_button.set_tooltip_text("Show navigation")
         navigation_button.connect("clicked", self._toggle_sidebar)
         header.pack_start(navigation_button)
-        self.apply_button = Gtk.Button(icon_name="document-save-symbolic")
-        self.apply_button.set_tooltip_text("Apply pending changes")
-        self.apply_button.add_css_class("suggested-action")
-        self.apply_button.set_sensitive(False)
-        self.apply_button.connect("clicked", self._save_pending)
-        header.pack_end(self.apply_button)
+        refresh_button = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh_button.set_tooltip_text("Refresh system status")
+        refresh_button.connect("clicked", lambda *_: self.refresh_runtime())
+        header.pack_end(refresh_button)
         toolbar.add_top_bar(header)
 
         self.split_view = Adw.OverlaySplitView()
@@ -111,15 +121,32 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.split_view.set_show_sidebar(True)
         toolbar.set_content(self.split_view)
 
+        self.pending_revealer = Gtk.Revealer(
+            transition_type=Gtk.RevealerTransitionType.SLIDE_UP,
+            reveal_child=False,
+        )
+        pending_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        pending_bar.add_css_class("pending-bar")
+        self.pending_label = Gtk.Label(label="Unsaved changes", xalign=0)
+        self.pending_label.set_hexpand(True)
+        pending_bar.append(self.pending_label)
+        discard_button = self._button("Discard", "edit-undo-symbolic", self._discard_pending)
+        pending_bar.append(discard_button)
+        self.apply_button = self._button("Apply", "object-select-symbolic", self._save_pending, "suggested-action")
+        pending_bar.append(self.apply_button)
+        self.pending_revealer.set_child(pending_bar)
+        toolbar.add_bottom_bar(self.pending_revealer)
+
         sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         sidebar.set_size_request(220, -1)
         sidebar.add_css_class("sidebar")
-        search = Gtk.SearchEntry(placeholder_text="Find settings")
-        search.set_margin_top(16)
-        search.set_margin_start(16)
-        search.set_margin_end(16)
-        search.connect("search-changed", self._filter_pages)
-        sidebar.append(search)
+        self.search_entry = Gtk.SearchEntry(placeholder_text="Find settings")
+        self.search_entry.set_tooltip_text("Search settings (Ctrl+K)")
+        self.search_entry.set_margin_top(16)
+        self.search_entry.set_margin_start(16)
+        self.search_entry.set_margin_end(16)
+        self.search_entry.connect("search-changed", self._filter_pages)
+        sidebar.append(self.search_entry)
         self.sidebar_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.sidebar_list.add_css_class("navigation-sidebar")
         self.sidebar_list.set_filter_func(self._page_filter)
@@ -153,6 +180,10 @@ class HyprControlWindow(Adw.ApplicationWindow):
         narrow.add_setter(self.split_view, "show-sidebar", False)
         self.add_breakpoint(narrow)
 
+        shortcuts = Gtk.EventControllerKey()
+        shortcuts.connect("key-pressed", self._window_key_pressed)
+        self.add_controller(shortcuts)
+
         self._build_home()
         self._build_displays()
         self._build_appearance()
@@ -162,6 +193,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self._build_advanced()
         self.sidebar_list.select_row(self.sidebar_list.get_row_at_index(0))
         self.loading = False
+        self._capture_file_snapshots()
         self.refresh_runtime()
 
     def toast(self, message: str, timeout: int = 3):
@@ -170,6 +202,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.toast_overlay.add_toast(toast)
 
     def _page(self, title: str, description: str) -> Adw.PreferencesPage:
+        self._building_page = next((key for key, label, _icon in self.pages if label == title), self._building_page)
         page = Adw.PreferencesPage()
         page.set_title(title)
         page.set_description(description)
@@ -181,11 +214,13 @@ class HyprControlWindow(Adw.ApplicationWindow):
 
     def _group(self, page: Adw.PreferencesPage, title: str, description: str = "") -> Adw.PreferencesGroup:
         group = Adw.PreferencesGroup(title=title, description=description)
+        group._page_name = self._building_page
         page.add(group)
         return group
 
     def _action_row(self, group, title, subtitle="", icon=None):
         row = Adw.ActionRow(title=title, subtitle=subtitle)
+        self._add_page_search_terms(getattr(group, "_page_name", self._building_page), title, subtitle)
         if icon:
             row.add_prefix(Gtk.Image.new_from_icon_name(icon))
         group.add(row)
@@ -197,6 +232,20 @@ class HyprControlWindow(Adw.ApplicationWindow):
     def _filter_pages(self, entry):
         self.page_query = entry.get_text().strip().lower()
         self.sidebar_list.invalidate_filter()
+        visible = [row for row in self._sidebar_rows() if self._page_filter(row)]
+        if self.page_query and len(visible) == 1:
+            self.sidebar_list.select_row(visible[0])
+
+    def _sidebar_rows(self):
+        index = 0
+        while (row := self.sidebar_list.get_row_at_index(index)) is not None:
+            yield row
+            index += 1
+
+    def _add_page_search_terms(self, page_name: str, *terms: str):
+        row = next((item for item in self._sidebar_rows() if item.page_name == page_name), None)
+        if row:
+            row.search_text += " " + " ".join(terms).lower()
 
     def _navigate(self, _listbox, row):
         if not row:
@@ -210,6 +259,20 @@ class HyprControlWindow(Adw.ApplicationWindow):
 
     def _toggle_sidebar(self, *_args):
         self.split_view.set_show_sidebar(not self.split_view.get_show_sidebar())
+
+    def _window_key_pressed(self, _controller, keyval, _keycode, state):
+        control = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        if control and keyval in (Gdk.KEY_k, Gdk.KEY_K):
+            self.split_view.set_show_sidebar(True)
+            self.search_entry.grab_focus()
+            return True
+        if control and keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and self._pending_count():
+            self._save_pending()
+            return True
+        if keyval == Gdk.KEY_Escape and self.search_entry.get_text():
+            self.search_entry.set_text("")
+            return True
+        return False
 
     def _resolved(self, path: Path, block: tuple[str, ...], key: str, fallback: str) -> str:
         value = get_value(self._config_text(path), block, key)
@@ -231,6 +294,10 @@ class HyprControlWindow(Adw.ApplicationWindow):
         return value.strip().lower().split(",", 1)[0] in {"1", "true", "yes", "on"}
 
     def _register(self, binding: Binding):
+        binding.original = binding.serialize()
+        binding.page = self._building_page
+        subtitle = binding.widget.get_subtitle() if hasattr(binding.widget, "get_subtitle") else ""
+        self._add_page_search_terms(binding.page, binding.widget.get_title(), subtitle or "", binding.key)
         index = len(self.setting_bindings)
         self.setting_bindings.append(binding)
         signal = {
@@ -244,8 +311,84 @@ class HyprControlWindow(Adw.ApplicationWindow):
     def _mark_dirty(self, index: int):
         if self.loading:
             return
-        self.dirty_bindings.add(index)
-        self.apply_button.set_sensitive(True)
+        binding = self.setting_bindings[index]
+        if binding.serialize() == binding.original:
+            self.dirty_bindings.discard(index)
+            binding.widget.remove_css_class("pending-setting")
+        else:
+            self.dirty_bindings.add(index)
+            binding.widget.add_css_class("pending-setting")
+        self._update_pending_bar()
+
+    def _pending_count(self) -> int:
+        return len(self.dirty_bindings) + int(self._idle_dirty) + len(self.shortcut_additions) + len(self.shortcut_removals)
+
+    def _update_pending_bar(self):
+        count = self._pending_count()
+        self.pending_label.set_label(f"{count} unsaved change{'s' if count != 1 else ''}")
+        self.apply_button.set_sensitive(bool(count) and not self.saving)
+        self.pending_revealer.set_reveal_child(bool(count))
+
+    @staticmethod
+    def _set_binding_widget(binding: Binding, value: str):
+        if binding.kind == "spin":
+            binding.widget.set_value(float(value))
+        elif binding.kind == "switch":
+            binding.widget.set_active(value == "true")
+        elif binding.kind == "entry":
+            binding.widget.set_text(value)
+        elif binding.kind == "combo" and binding.values:
+            binding.widget.set_selected(binding.values.index(value))
+
+    def _discard_pending(self, *_args):
+        self.loading = True
+        for binding in self.setting_bindings:
+            self._set_binding_widget(binding, binding.original)
+            binding.widget.remove_css_class("pending-setting")
+        if self._idle_original:
+            saver, lock, suspend, delay = self._idle_original
+            self.saver_delay.set_value(saver)
+            self.lock_delay.set_value(lock)
+            self.suspend_idle.set_active(suspend)
+            self.suspend_delay.set_value(delay)
+        self.loading = False
+        self.dirty_bindings.clear()
+        self._idle_dirty = False
+        self.shortcut_additions.clear()
+        self.shortcut_removals.clear()
+        self._populate_shortcuts()
+        self._update_idle_timeline()
+        self._update_pending_bar()
+        self.toast("Pending changes discarded")
+
+    def _close_requested(self, *_args):
+        if not self._pending_count() and not self.advanced_dirty:
+            return False
+        dialog = Adw.AlertDialog(
+            heading="Discard unsaved changes?",
+            body="Hypr Control has changes that have not been applied.",
+        )
+        dialog.add_response("cancel", "Keep editing")
+        dialog.add_response("discard", "Discard")
+        dialog.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dialog.connect("response", lambda _dialog, response: self.destroy() if response == "discard" else None)
+        dialog.present(self)
+        return True
+
+    @staticmethod
+    def _owned_text(path: Path) -> str | None:
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+
+    def _capture_file_snapshots(self):
+        paths = {binding.path for binding in self.setting_bindings}
+        paths.update({HYPR / "hypridle.conf", HYPR / "bindings.conf"})
+        self.file_snapshots.update({path: self._owned_text(path) for path in paths})
+
+    def _externally_changed(self, paths):
+        return [path for path in paths if path in self.file_snapshots and self._owned_text(path) != self.file_snapshots[path]]
 
     def _spin(self, group, title, subtitle, path, block, key, fallback, minimum, maximum, step, digits=0):
         row = Adw.SpinRow.new_with_range(minimum, maximum, step)
@@ -286,7 +429,8 @@ class HyprControlWindow(Adw.ApplicationWindow):
 
     def _button(self, label, icon, callback, css=None):
         button = Gtk.Button(label=label)
-        button.set_icon_name(icon)
+        if icon:
+            button.set_icon_name(icon)
         button.connect("clicked", callback)
         if css:
             button.add_css_class(css)
@@ -299,6 +443,11 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.status_compositor = self._action_row(status, "Hyprland", "Checking compositor", "preferences-system-symbolic")
         self.status_config = self._action_row(status, "Configuration", "Checking for errors", "emblem-ok-symbolic")
         self.status_display = self._action_row(status, "Active display", "Checking outputs", "video-display-symbolic")
+
+        desktop = self._group(page, "Desktop at a glance")
+        self.status_style = self._action_row(desktop, "Theme and font", "Checking Omarchy style", "applications-graphics-symbolic")
+        self.status_input = self._action_row(desktop, "Input devices", "Checking connected devices", "input-mouse-symbolic")
+        self.recent_change_row = self._action_row(desktop, "Recent change", self.recent_change, "document-open-recent-symbolic")
 
         actions = self._group(page, "Quick actions")
         display = self._action_row(actions, "Display layout", "Arrange monitors, choose modes, and set scaling", "video-display-symbolic")
@@ -353,11 +502,20 @@ class HyprControlWindow(Adw.ApplicationWindow):
 
         look = HYPR / "looknfeel.conf"
         geometry = self._group(page, "Window geometry")
+        presets = self._action_row(geometry, "Presets", "Apply a coordinated starting point", "applications-graphics-symbolic")
+        preset_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        for label, values in (
+            ("Compact", (3, 5, 1, 0)),
+            ("Balanced", (5, 10, 2, 8)),
+            ("Spacious", (10, 18, 2, 14)),
+        ):
+            preset_buttons.append(self._button(label, "", lambda _button, preset=values: self._apply_appearance_preset(preset)))
+        presets.add_suffix(preset_buttons)
         self._combo(geometry, "Layout", "How new windows are arranged", look, ("general",), "layout", ["dwindle", "master", "scrolling"], ["Dwindle", "Master", "Scrolling"], "dwindle")
-        self._spin(geometry, "Inner gaps", "Space between windows", look, ("general",), "gaps_in", 5, 0, 40, 1)
-        self._spin(geometry, "Outer gaps", "Space around the screen edge", look, ("general",), "gaps_out", 10, 0, 60, 1)
-        self._spin(geometry, "Border width", "Window border thickness", look, ("general",), "border_size", 2, 0, 10, 1)
-        self._spin(geometry, "Corner radius", "Rounded window corners", look, ("decoration",), "rounding", 0, 0, 30, 1)
+        self.inner_gaps = self._spin(geometry, "Inner gaps", "Space between windows", look, ("general",), "gaps_in", 5, 0, 40, 1)
+        self.outer_gaps = self._spin(geometry, "Outer gaps", "Space around the screen edge", look, ("general",), "gaps_out", 10, 0, 60, 1)
+        self.border_width = self._spin(geometry, "Border width", "Window border thickness", look, ("general",), "border_size", 2, 0, 10, 1)
+        self.corner_radius = self._spin(geometry, "Corner radius", "Rounded window corners", look, ("decoration",), "rounding", 0, 0, 30, 1)
 
         effects = self._group(page, "Effects")
         self._switch(effects, "Animations", "Animate windows, layers, and workspaces", look, ("animations",), "enabled", True)
@@ -371,6 +529,13 @@ class HyprControlWindow(Adw.ApplicationWindow):
         opacity = self._group(page, "Opacity")
         self._spin(opacity, "Active windows", "Opacity of the focused window", look, ("decoration",), "active_opacity", 1, 0.2, 1, 0.05, 2)
         self._spin(opacity, "Inactive windows", "Opacity of unfocused windows", look, ("decoration",), "inactive_opacity", 1, 0.2, 1, 0.05, 2)
+
+    def _apply_appearance_preset(self, values):
+        for widget, value in zip(
+            (self.inner_gaps, self.outer_gaps, self.border_width, self.corner_radius), values
+        ):
+            widget.set_value(value)
+        self.toast("Appearance preset staged — apply to keep it")
 
     def _build_input(self):
         page = self._page("Keyboard & Mouse", "Keyboard layout, repeat behavior, pointer, and touchpad")
@@ -404,7 +569,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.suspend_toggle = self._runtime_switch(services, "Suspend in system menu", "Show suspend as a session action", "preferences-system-power-symbolic", self._suspend_enabled, ["omarchy", "toggle", "suspend"])
         self.nightlight_toggle = self._runtime_switch(services, "Night light", "Reduce blue light with a warmer display", "weather-clear-night-symbolic", self._nightlight_enabled, ["omarchy", "toggle", "nightlight"])
 
-        idle = self._group(page, "Idle timing", "Timers restart after each action, so lock delay is measured after the screensaver starts")
+        idle = self._group(page, "Idle timeline", "Each point is measured from the last keyboard or pointer activity")
         idle_text = self._config_text(HYPR / "hypridle.conf")
         saver_seconds = listener_timeout(idle_text, "omarchy-launch-screensaver") or 120
         lock_seconds = listener_timeout(idle_text, "omarchy-system-lock") or 122
@@ -414,10 +579,10 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.saver_delay.set_subtitle("Minutes with no input")
         self.saver_delay.set_value(max(1, round(saver_seconds / 60)))
         idle.add(self.saver_delay)
-        self.lock_delay = Adw.SpinRow.new_with_range(1, 120, 1)
+        self.lock_delay = Adw.SpinRow.new_with_range(0, 120, 1)
         self.lock_delay.set_title("Lock after screensaver")
-        self.lock_delay.set_subtitle("Additional idle minutes")
-        self.lock_delay.set_value(max(1, round(lock_seconds / 60)))
+        self.lock_delay.set_subtitle("Additional minutes; 0 locks immediately")
+        self.lock_delay.set_value(max(0, round((lock_seconds - saver_seconds) / 60)))
         idle.add(self.lock_delay)
         self.suspend_idle = Adw.SwitchRow(title="Suspend automatically", subtitle="Put the computer to sleep after extended inactivity")
         self.suspend_idle.set_active(suspend_seconds is not None)
@@ -432,6 +597,11 @@ class HyprControlWindow(Adw.ApplicationWindow):
             signal = "notify::active" if isinstance(widget, Adw.SwitchRow) else "notify::value"
             widget.connect(signal, self._mark_idle_dirty)
         self.suspend_idle.connect("notify::active", lambda row, *_: self.suspend_delay.set_sensitive(row.get_active()))
+        self.idle_timeline = self._action_row(idle, "Current sequence", "", "appointment-soon-symbolic")
+        self.idle_timeline.set_sensitive(False)
+        self.idle_timeline.add_css_class("timeline-row")
+        self._idle_original = self._idle_state()
+        self._update_idle_timeline()
 
         night = self._group(page, "Night light temperature")
         self.night_temp = Adw.SpinRow.new_with_range(2500, 6000, 100)
@@ -468,8 +638,25 @@ class HyprControlWindow(Adw.ApplicationWindow):
     def _mark_idle_dirty(self, *_args):
         if self.loading:
             return
-        self.apply_button.set_sensitive(True)
-        self._idle_dirty = True
+        self._idle_dirty = self._idle_state() != self._idle_original
+        self._update_idle_timeline()
+        self._update_pending_bar()
+
+    def _idle_state(self):
+        return (
+            self.saver_delay.get_value(),
+            self.lock_delay.get_value(),
+            self.suspend_idle.get_active(),
+            self.suspend_delay.get_value(),
+        )
+
+    def _update_idle_timeline(self):
+        saver = int(self.saver_delay.get_value())
+        lock = saver + int(self.lock_delay.get_value())
+        stages = [f"{saver} min  Screensaver", f"{lock} min  Lock"]
+        if self.suspend_idle.get_active():
+            stages.append(f"{int(self.suspend_delay.get_value())} min  Suspend")
+        self.idle_timeline.set_subtitle("   →   ".join(stages))
 
     def _build_shortcuts(self):
         page = self._page("Shortcuts", "Personal shortcuts layered over Omarchy defaults")
@@ -530,13 +717,55 @@ class HyprControlWindow(Adw.ApplicationWindow):
         modifiers = Adw.EntryRow(title="Modifiers")
         modifiers.set_text("SUPER SHIFT")
         key = Adw.EntryRow(title="Key")
+        capture = Adw.ActionRow(title="Capture shortcut", subtitle="Press the button, then type the key combination")
+        capture_button = self._button("Record", "media-record-symbolic", lambda *_: None)
+        capture.add_suffix(capture_button)
         command = Adw.EntryRow(title="Command")
         group.add(description)
+        group.add(capture)
         group.add(modifiers)
         group.add(key)
         group.add(command)
         toolbar.set_content(page)
         dialog.set_content(toolbar)
+
+        capture_state = {"active": False}
+
+        def begin_capture(*_args):
+            capture_state["active"] = True
+            capture_button.set_label("Press keys…")
+            capture.add_css_class("pending-setting")
+
+        def captured(_controller, keyval, _keycode, state):
+            if not capture_state["active"]:
+                return False
+            if keyval == Gdk.KEY_Escape:
+                capture_state["active"] = False
+                capture_button.set_label("Record")
+                capture.remove_css_class("pending-setting")
+                return True
+            if keyval in {
+                Gdk.KEY_Shift_L, Gdk.KEY_Shift_R, Gdk.KEY_Control_L, Gdk.KEY_Control_R,
+                Gdk.KEY_Alt_L, Gdk.KEY_Alt_R, Gdk.KEY_Super_L, Gdk.KEY_Super_R,
+            }:
+                return True
+            masks = (
+                (Gdk.ModifierType.SUPER_MASK, "SUPER"),
+                (Gdk.ModifierType.CONTROL_MASK, "CTRL"),
+                (Gdk.ModifierType.ALT_MASK, "ALT"),
+                (Gdk.ModifierType.SHIFT_MASK, "SHIFT"),
+            )
+            modifiers.set_text(" ".join(name for mask, name in masks if state & mask))
+            key.set_text(Gdk.keyval_name(keyval) or "")
+            capture_state["active"] = False
+            capture_button.set_label("Record again")
+            capture.remove_css_class("pending-setting")
+            return True
+
+        capture_button.connect("clicked", begin_capture)
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", captured)
+        dialog.add_controller(key_controller)
 
         def submit(*_):
             if not key.get_text().strip() or not command.get_text().strip():
@@ -545,7 +774,8 @@ class HyprControlWindow(Adw.ApplicationWindow):
             mods = modifiers.get_text().strip().upper()
             pressed = key.get_text().strip().upper()
             conflicts = parse_bindings(self._config_text(HYPR / "bindings.conf"))
-            if any(item["mods"].upper() == mods and item["key"].upper() == pressed for item in conflicts):
+            chord = shortcut_chord(mods, pressed)
+            if any(shortcut_chord(str(item["mods"]), str(item["key"])) == chord for item in conflicts):
                 self.toast("That combination already exists in your personal shortcuts")
                 return
             line = f"bindd = {mods}, {pressed}, {description.get_text().strip()}, exec, {command.get_text().strip()}"
@@ -569,8 +799,8 @@ class HyprControlWindow(Adw.ApplicationWindow):
                 if replace:
                     self.shortcut_additions.append(f"unbind = {mods}, {pressed}")
                 self.shortcut_additions.append(line)
-                self.apply_button.set_sensitive(True)
                 self._populate_shortcuts()
+                self._update_pending_bar()
                 dialog.close()
 
             if conflict:
@@ -598,10 +828,12 @@ class HyprControlWindow(Adw.ApplicationWindow):
                 self.shortcut_additions.pop(index - 1)
         else:
             self.shortcut_removals.add(line)
-        self.apply_button.set_sensitive(True)
         self._populate_shortcuts()
+        self._update_pending_bar()
 
     def _build_advanced(self):
+        self._building_page = "advanced"
+        self._add_page_search_terms("advanced", "raw configuration editor backups restore diff files")
         page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         page.set_margin_top(18)
         page.set_margin_bottom(18)
@@ -629,6 +861,8 @@ class HyprControlWindow(Adw.ApplicationWindow):
         controls.append(self.advanced_combo)
         discard = self._button("Discard edits", "edit-undo-symbolic", self._advanced_discard)
         controls.append(discard)
+        history = self._button("Backups", "document-revert-symbolic", self._show_backups)
+        controls.append(history)
         self.advanced_save = self._button("Save file", "document-save-symbolic", self._save_advanced, "suggested-action")
         self.advanced_save.set_sensitive(False)
         controls.append(self.advanced_save)
@@ -650,6 +884,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self._advanced_switching = True
         self.advanced_current = name
         self.editor.get_buffer().set_text(self._config_text(HYPR / name))
+        self.advanced_snapshot = self._owned_text(HYPR / name)
         self.advanced_dirty = False
         self.advanced_save.set_sensitive(False)
         self._advanced_switching = False
@@ -680,17 +915,80 @@ class HyprControlWindow(Adw.ApplicationWindow):
         buffer = self.editor.get_buffer()
         text = buffer.get_text(buffer.get_start_iter(), buffer.get_end_iter(), True)
         path = HYPR / self.advanced_current
-        backup = atomic_write(path, text)
+        current = self._owned_text(path)
+        snapshot = getattr(self, "advanced_snapshot", current)
+        if current != snapshot:
+            self._show_error("File changed outside Hypr Control", "Reload the file before applying your edits so another program's changes are not overwritten.")
+            return
+        diff = "\n".join(
+            difflib.unified_diff(
+                (current or "").splitlines(), text.splitlines(),
+                fromfile=f"{self.advanced_current} (current)", tofile=f"{self.advanced_current} (proposed)", lineterm="",
+            )
+        )
+        preview = diff if len(diff) <= 5000 else diff[:5000] + "\n… diff shortened …"
+        dialog = Adw.AlertDialog(heading=f"Apply changes to {self.advanced_current}?", body=preview or "No textual changes")
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("apply", "Apply")
+        dialog.set_response_appearance("apply", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", lambda _dialog, response: self._commit_advanced(path, text) if response == "apply" else None)
+        dialog.present(self)
+
+    def _commit_advanced(self, path, text):
         self.advanced_save.set_sensitive(False)
-        self._validate_and_restart({path: backup}, lambda ok, msg: self._advanced_saved(ok, msg))
+        self._apply_transaction({path: text}, lambda ok, msg: self._advanced_saved(ok, msg))
 
     def _advanced_saved(self, ok, message):
         if ok:
             self.advanced_dirty = False
+            self.advanced_snapshot = self._owned_text(HYPR / self.advanced_current)
+            self.file_snapshots[HYPR / self.advanced_current] = self.advanced_snapshot
             self.toast(f"Saved {self.advanced_current}")
         else:
             self._load_advanced(self.advanced_current)
             self._show_error("The change was reverted", message)
+
+    def _show_backups(self, *_args):
+        path = HYPR / self.advanced_current
+        history = backup_history(path)
+        if not history:
+            self.toast(f"No backups found for {self.advanced_current}")
+            return
+        dialog = Adw.Window(transient_for=self, modal=True, title="Configuration backups")
+        dialog.set_default_size(620, 480)
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(Adw.WindowTitle(title="Backups", subtitle=self.advanced_current))
+        toolbar.add_top_bar(header)
+        page = Adw.PreferencesPage()
+        group = Adw.PreferencesGroup(title="Newest first", description="Restoring also validates and can be rolled back")
+        page.add(group)
+        for backup in history:
+            stamp = backup.name.rsplit(".bak.hypr-control-", 1)[-1]
+            row = Adw.ActionRow(title=stamp, subtitle=f"{backup.stat().st_size:,} bytes")
+            button = self._button("Restore", "document-revert-symbolic", lambda _button, item=backup: self._restore_backup(path, item, dialog))
+            row.add_suffix(button)
+            group.add(row)
+        toolbar.set_content(page)
+        dialog.set_content(toolbar)
+        dialog.present()
+
+    def _restore_backup(self, path, backup, dialog):
+        try:
+            text = backup.read_text(encoding="utf-8")
+        except OSError as error:
+            self._show_error("Could not read backup", str(error))
+            return
+        dialog.close()
+        self._apply_transaction({path: text}, lambda ok, msg: self._backup_restored(path, ok, msg))
+
+    def _backup_restored(self, path, ok, message):
+        if ok:
+            self._load_advanced(path.name)
+            self.file_snapshots[path] = self._owned_text(path)
+            self.toast(f"Restored {path.name}")
+        else:
+            self._show_error("The restore was reverted", message)
 
     def _save_pending(self, *_args):
         changed: dict[Path, str] = {}
@@ -703,10 +1001,19 @@ class HyprControlWindow(Adw.ApplicationWindow):
         if getattr(self, "_idle_dirty", False):
             path = HYPR / "hypridle.conf"
             text = self._config_text(path)
-            text = set_listener_timeout(text, "omarchy-launch-screensaver", int(self.saver_delay.get_value() * 60))
-            text = set_listener_timeout(text, "omarchy-system-lock", int(self.lock_delay.get_value() * 60))
+            try:
+                saver_seconds, lock_seconds, suspend_seconds = idle_timeouts(
+                    self.saver_delay.get_value(),
+                    self.lock_delay.get_value(),
+                    self.suspend_delay.get_value() if self.suspend_idle.get_active() else None,
+                )
+            except ValueError:
+                self._show_error("Suspend must come after lock", "Choose a suspend time later than the lock point in the idle timeline.")
+                return
+            text = set_listener_timeout(text, "omarchy-launch-screensaver", saver_seconds)
+            text = set_listener_timeout(text, "omarchy-system-lock", lock_seconds)
             if self.suspend_idle.get_active():
-                text = set_listener_timeout(text, "systemctl suspend", int(self.suspend_delay.get_value() * 60), "systemctl suspend")
+                text = set_listener_timeout(text, "systemctl suspend", suspend_seconds or 0, "systemctl suspend")
             else:
                 text = remove_listener(text, "systemctl suspend")
             changed[path] = text
@@ -720,49 +1027,69 @@ class HyprControlWindow(Adw.ApplicationWindow):
 
         if not changed:
             return
-        backups = {path: atomic_write(path, text) for path, text in changed.items()}
-        self.apply_button.set_sensitive(False)
-        self._validate_and_restart(backups, self._settings_saved)
+        conflicts = self._externally_changed(changed)
+        if conflicts:
+            names = ", ".join(path.name for path in conflicts)
+            self._show_error("Configuration changed outside Hypr Control", f"Reload Hypr Control before applying so changes to {names} are not overwritten.")
+            return
+        self.saving = True
+        self._update_pending_bar()
+        self._apply_transaction(changed, self._settings_saved)
 
     def _settings_saved(self, ok, message):
+        self.saving = False
         if ok:
+            for binding in self.setting_bindings:
+                binding.original = binding.serialize()
+                binding.widget.remove_css_class("pending-setting")
             self.dirty_bindings.clear()
             self.shortcut_additions.clear()
             self.shortcut_removals.clear()
             self._idle_dirty = False
+            self._idle_original = self._idle_state()
             self._populate_shortcuts()
-            self.toast("Settings applied")
+            self._capture_file_snapshots()
+            self.recent_change = "Settings applied successfully"
+            if hasattr(self, "recent_change_row"):
+                self.recent_change_row.set_subtitle(self.recent_change)
+            self._update_pending_bar()
+            self.toast("Settings applied safely")
             self.refresh_runtime()
         else:
-            self.apply_button.set_sensitive(True)
+            self._update_pending_bar()
             self._show_error("The changes were reverted", message)
 
-    def _validate_and_restart(self, backups: dict[Path, Path | None], callback):
+    def _validate_changes(self, names: set[str]):
+        hypr_files = names - {"hypridle.conf", "hyprsunset.conf", "hyprlock.conf"}
+        ok, message = True, ""
+        if hypr_files:
+            reload_result = subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, timeout=15)
+            errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, timeout=15)
+            message = (reload_result.stderr + errors.stdout + errors.stderr).strip()
+            ok = reload_result.returncode == 0 and errors.returncode == 0 and not errors.stdout.strip()
+        if ok and "hypridle.conf" in names:
+            result = subprocess.run(["omarchy", "restart", "hypridle"], capture_output=True, text=True, timeout=30)
+            ok, message = result.returncode == 0, (result.stdout + result.stderr).strip()
+        if ok and "hyprsunset.conf" in names:
+            result = subprocess.run(["omarchy", "restart", "hyprsunset"], capture_output=True, text=True, timeout=30)
+            ok, message = result.returncode == 0, (result.stdout + result.stderr).strip()
+        return ok, message
+
+    def _apply_transaction(self, changes: dict[Path, str], callback):
         def work():
-            names = {path.name for path in backups}
+            names = {path.name for path in changes}
             hypr_files = names - {"hypridle.conf", "hyprsunset.conf", "hyprlock.conf"}
-            ok, message = True, ""
             try:
-                if hypr_files:
-                    reload_result = subprocess.run(["hyprctl", "reload"], capture_output=True, text=True)
-                    errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True)
-                    message = (reload_result.stderr + errors.stdout + errors.stderr).strip()
-                    ok = reload_result.returncode == 0 and errors.returncode == 0 and not errors.stdout.strip()
-                if ok and "hypridle.conf" in names:
-                    result = subprocess.run(["omarchy", "restart", "hypridle"], capture_output=True, text=True)
-                    ok, message = result.returncode == 0, (result.stdout + result.stderr).strip()
-                if ok and "hyprsunset.conf" in names:
-                    result = subprocess.run(["omarchy", "restart", "hyprsunset"], capture_output=True, text=True)
-                    ok, message = result.returncode == 0, (result.stdout + result.stderr).strip()
-            except OSError as error:
+                ok, message, _backups = transactional_write(changes, lambda: self._validate_changes(names))
+            except (OSError, subprocess.TimeoutExpired) as error:
                 ok, message = False, str(error)
             if not ok:
-                for path, backup in backups.items():
-                    restore_backup(path, backup)
                 if hypr_files:
                     subprocess.run(["hyprctl", "reload"], capture_output=True)
                 if "hypridle.conf" in names:
                     subprocess.run(["omarchy", "restart", "hypridle"], capture_output=True)
+                if "hyprsunset.conf" in names:
+                    subprocess.run(["omarchy", "restart", "hyprsunset"], capture_output=True)
             GLib.idle_add(callback, ok, message or "Hyprland rejected the configuration")
 
         threading.Thread(target=work, daemon=True).start()
@@ -824,15 +1151,22 @@ class HyprControlWindow(Adw.ApplicationWindow):
             version = self._output(["hyprctl", "version"]).splitlines()
             errors = self._output(["hyprctl", "configerrors"]).strip()
             raw = self._output(["hyprctl", "-j", "monitors", "all"])
+            devices_raw = self._output(["hyprctl", "-j", "devices"])
+            theme = self._output(["omarchy", "theme", "current"])
+            font = self._output(["omarchy", "font", "current"])
             try:
                 monitors = json.loads(raw)
             except json.JSONDecodeError:
                 monitors = []
-            GLib.idle_add(self._render_runtime, version, errors, monitors)
+            try:
+                devices = json.loads(devices_raw)
+            except json.JSONDecodeError:
+                devices = {}
+            GLib.idle_add(self._render_runtime, version, errors, monitors, devices, theme, font)
 
         threading.Thread(target=work, daemon=True).start()
 
-    def _render_runtime(self, version, errors, monitors):
+    def _render_runtime(self, version, errors, monitors, devices, theme, font):
         label = version[0] if version else "Compositor unavailable"
         self.status_compositor.set_subtitle(label)
         self.status_config.set_subtitle(errors or "No configuration errors")
@@ -841,6 +1175,9 @@ class HyprControlWindow(Adw.ApplicationWindow):
             self.status_display.set_subtitle(f"{active['name']} · {active['width']}×{active['height']} @ {active['refreshRate']:.0f} Hz · {active['scale']:.2g}×")
         else:
             self.status_display.set_subtitle("No live output data")
+        self.status_style.set_subtitle(" · ".join(value for value in (theme, font) if value) or "Omarchy style unavailable")
+        device_count = sum(len(devices.get(kind, [])) for kind in ("keyboards", "mice", "touchpads", "tablets"))
+        self.status_input.set_subtitle(f"{device_count} connected device{'s' if device_count != 1 else ''}")
 
         for row in self.display_rows:
             self.display_group.remove(row)
