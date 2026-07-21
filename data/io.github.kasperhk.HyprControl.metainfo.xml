@@ -10,7 +10,7 @@
   </developer>
   <description>
     <p>Hypr Control provides a graphical control center for common Hyprland and Omarchy settings, including appearance, input, idle behavior, shortcuts, and raw configuration files.</p>
-    <p>Configuration writes are backed up, validated with Hyprland, and reverted automatically when validation fails.</p>
+    <p>Configuration changes are transactional, backed up, validated with Hyprland, and reverted automatically when validation fails.</p>
   </description>
   <launchable type="desktop-id">io.github.kasperhk.HyprControl.desktop</launchable>
   <url type="homepage">https://github.com/kasperhk/hypr-control</url>
@@ -19,7 +19,26 @@
     <binary>hypr-control-center</binary>
   </provides>
   <content_rating type="oars-1.1" />
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/kasperhk/hypr-control/main/assets/hypr-control-overview.png</image>
+      <caption>Live Hyprland and Omarchy status with common actions</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/kasperhk/hypr-control/main/assets/hypr-control-appearance.png</image>
+      <caption>Appearance presets and detailed window effects</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/kasperhk/hypr-control/main/assets/hypr-control-power.png</image>
+      <caption>Power controls and the chronological idle timeline</caption>
+    </screenshot>
+  </screenshots>
   <releases>
+    <release version="0.2.0" date="2026-07-21">
+      <description>
+        <p>Adds transactional saves, external-change protection, search, appearance presets, shortcut capture, backup restoration, and a corrected idle timeline.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-07-21" />
   </releases>
 </component>

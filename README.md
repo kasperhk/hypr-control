@@ -4,25 +4,23 @@ Hypr Control is a native GTK 4/libadwaita control center for Hyprland on [Omarch
 
 > Hypr Control is an independent community project. It is not affiliated with or endorsed by Hyprland or Omarchy.
 
-![Hypr Control overview](assets/hypr-control.png)
+![Hypr Control overview](assets/hypr-control-overview.png)
+
+| Appearance | Power & Idle |
+| --- | --- |
+| ![Appearance settings with coordinated presets](assets/hypr-control-appearance.png) | ![Power and idle settings with a chronological timeline](assets/hypr-control-power.png) |
 
 ## Features
 
-- Live Hyprland, configuration, and monitor status
-- Window gaps, borders, rounding, blur, shadows, dimming, and opacity
-- Keyboard, pointer, and touchpad settings
-- Omarchy themes, fonts, wallpapers, idle automation, locking, and night light
-- Personal shortcut creation with live conflict detection
-- Display layout handoff to `nwg-displays`
-- Raw editor for user-owned Hyprland configuration files
-- Automatic timestamped backups, `hyprctl configerrors` validation, and rollback
-- Transactional multi-file saves with complete rollback on write or validation failure
-- Protection against overwriting configuration changed by another application
-- Search across setting names, descriptions, and Hyprland keys (`Ctrl+K`)
+- Live compositor, configuration, display, theme, font, and input-device status
+- Omarchy themes, fonts, wallpapers, appearance presets, and detailed window effects
+- Keyboard, pointer, touchpad, idle, locking, night-light, and power controls
+- Direct shortcut capture with live, normalized conflict detection
+- Search across settings, descriptions, and Hyprland keys with `Ctrl+K`
 - A persistent pending-change bar with Apply and Discard actions
-- Coordinated appearance presets and a chronological idle timeline
-- Direct shortcut capture with normalized conflict detection
-- Raw-editor diffs plus browsable, restorable configuration history
+- Transactional multi-file saves, external-change protection, validation, and complete rollback
+- Raw configuration editing with diff previews and browsable backup history
+- Optional visual display-layout handoff to `nwg-displays`
 
 ## Requirements
 
@@ -32,7 +30,7 @@ Hypr Control currently targets an up-to-date Omarchy installation. It expects:
 - GTK 4, libadwaita, and PyGObject
 - Hyprland and `hyprctl`
 - Omarchy's `omarchy` command
-- `nwg-displays` for the visual display layout editor
+- Optional: `nwg-displays` for the visual display layout editor
 
 On Omarchy these dependencies are normally already installed. The app reads Omarchy's defaults when a split config file is not present and writes only to the user's XDG Hyprland config directory (normally `~/.config/hypr`).
 
@@ -62,13 +60,25 @@ Set `PREFIX` to install under another user prefix:
 PREFIX="$HOME/.local" ./install.sh
 ```
 
+## Update
+
+Pull the latest release from an existing clone and run the installer again:
+
+```bash
+cd hypr-control
+git pull --ff-only
+./install.sh
+```
+
+The installer replaces only Hypr Control's files under the selected user prefix. It does not modify your Hyprland configuration.
+
 ## Safety model
 
 Before changing an existing file, Hypr Control creates a uniquely timestamped sibling backup named `*.bak.hypr-control-*`. A group of pending changes is treated as one transaction: Hyprland is reloaded, `hyprctl configerrors` is checked, and affected Omarchy services are restarted. If any write or validation step fails, every touched file is restored. Newly created files are removed on rollback. The newest 20 backups per file remain available from the Advanced page.
 
 Hypr Control also records the user-owned file contents it loaded. If another application changes one of those files while settings are pending, applying stops instead of silently overwriting the external change.
 
-The display layout editor is deliberately delegated to `nwg-displays`, which owns the generated monitor and workspace files on Omarchy.
+When installed, the visual display layout editor is deliberately delegated to `nwg-displays`, which owns the generated monitor and workspace files on Omarchy.
 
 ## Development
 
