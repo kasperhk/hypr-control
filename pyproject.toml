@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hypr-control"
+version = "0.1.0"
+description = "A native GTK 4 control center for Hyprland on Omarchy"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Kasper" }]
+keywords = ["hyprland", "omarchy", "gtk4", "libadwaita", "settings"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: X11 Applications :: GTK",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Topic :: Desktop Environment",
+]
+
+[project.urls]
+Homepage = "https://github.com/kasperhk/hypr-control"
+Issues = "https://github.com/kasperhk/hypr-control/issues"
+
+[project.scripts]
+hypr-control-center = "hypr_control_center.app:main"
+
+[tool.setuptools.package-data]
+hypr_control_center = ["style.css"]

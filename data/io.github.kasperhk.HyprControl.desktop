@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Hypr Control
+GenericName=Hyprland Settings
+Comment=Configure Hyprland and Omarchy
+Exec=hypr-control-center
+Icon=io.github.kasperhk.HyprControl
+Terminal=false
+Type=Application
+Categories=Settings;DesktopSettings;
+Keywords=Hyprland;Omarchy;display;keyboard;power;appearance;shortcuts;
+StartupNotify=true
+StartupWMClass=io.github.kasperhk.HyprControl

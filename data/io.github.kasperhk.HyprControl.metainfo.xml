@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.kasperhk.HyprControl</id>
+  <name>Hypr Control</name>
+  <summary>Configure Hyprland and Omarchy from a native GTK application</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.kasperhk">
+    <name>Kasper</name>
+  </developer>
+  <description>
+    <p>Hypr Control provides a graphical control center for common Hyprland and Omarchy settings, including appearance, input, idle behavior, shortcuts, and raw configuration files.</p>
+    <p>Configuration writes are backed up, validated with Hyprland, and reverted automatically when validation fails.</p>
+  </description>
+  <launchable type="desktop-id">io.github.kasperhk.HyprControl.desktop</launchable>
+  <url type="homepage">https://github.com/kasperhk/hypr-control</url>
+  <url type="bugtracker">https://github.com/kasperhk/hypr-control/issues</url>
+  <provides>
+    <binary>hypr-control-center</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-07-21" />
+  </releases>
+</component>
