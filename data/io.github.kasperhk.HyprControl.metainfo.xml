@@ -9,7 +9,7 @@
     <name>Kasper</name>
   </developer>
   <description>
-    <p>Hypr Control provides a graphical control center for common Hyprland and Omarchy settings, including appearance, input, idle behavior, shortcuts, and raw configuration files.</p>
+    <p>Hypr Control provides a graphical control center for common Hyprland and Omarchy settings, including native display layouts and automatic display profiles, appearance, input, idle behavior, shortcuts, and raw configuration files.</p>
     <p>Configuration changes are transactional, backed up, validated with Hyprland, and reverted automatically when validation fails.</p>
   </description>
   <launchable type="desktop-id">io.github.kasperhk.HyprControl.desktop</launchable>
@@ -34,6 +34,11 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.3.0" date="2026-07-23">
+      <description>
+        <p>Adds native display arrangement, quick display modes, safe previews, stable setup memory, and automatic hotplug switching.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-07-21">
       <description>
         <p>Adds transactional saves, external-change protection, search, appearance presets, shortcut capture, backup restoration, and a corrected idle timeline.</p>

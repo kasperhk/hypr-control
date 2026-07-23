@@ -16,4 +16,8 @@ Run the test suite before submitting a change:
 make test
 ```
 
-Keep configuration writes inside `~/.config/hypr`, preserve comments where possible, and add a regression test for changes to the parser or backup behavior.
+Keep Hyprland configuration writes inside `~/.config/hypr`, preserve comments
+where possible, and keep persistent application data inside the appropriate XDG
+directory. Display discovery, identity, profile matching, and geometry belong
+in the GUI-independent `hypr_control_center.displays` package. Add regression
+tests for parser, backup, profile, or layout behavior.

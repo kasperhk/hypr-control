@@ -48,3 +48,14 @@
 .timeline-row {
   font-feature-settings: "tnum";
 }
+
+.display-mode-button {
+  min-height: 48px;
+  font-weight: 600;
+}
+
+.display-canvas {
+  border-radius: 10px;
+  background: color-mix(in srgb, @view_bg_color 92%, @window_fg_color);
+  border: 1px solid color-mix(in srgb, @window_fg_color 10%, transparent);
+}

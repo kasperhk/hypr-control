@@ -13,6 +13,9 @@ Hypr Control is a native GTK 4/libadwaita control center for Hyprland on [Omarch
 ## Features
 
 - Live compositor, configuration, display, theme, font, and input-device status
+- Native drag-and-drop display layouts with Extend, Mirror, External-only, and Internal-only modes
+- Stable EDID- and dock-aware setup memory with automatic hotplug switching
+- Per-output resolution, refresh rate, scaling, rotation, position, enablement, and 10-bit controls
 - Omarchy themes, fonts, wallpapers, appearance presets, and detailed window effects
 - Keyboard, pointer, touchpad, idle, locking, night-light, and power controls
 - Direct shortcut capture with live, normalized conflict detection
@@ -20,7 +23,7 @@ Hypr Control is a native GTK 4/libadwaita control center for Hyprland on [Omarch
 - A persistent pending-change bar with Apply and Discard actions
 - Transactional multi-file saves, external-change protection, validation, and complete rollback
 - Raw configuration editing with diff previews and browsable backup history
-- Optional visual display-layout handoff to `nwg-displays`
+- Fifteen-second display previews with automatic recovery if a layout becomes unusable
 
 ## Requirements
 
@@ -30,7 +33,6 @@ Hypr Control currently targets an up-to-date Omarchy installation. It expects:
 - GTK 4, libadwaita, and PyGObject
 - Hyprland and `hyprctl`
 - Omarchy's `omarchy` command
-- Optional: `nwg-displays` for the visual display layout editor
 
 On Omarchy these dependencies are normally already installed. The app reads Omarchy's defaults when a split config file is not present and writes only to the user's XDG Hyprland config directory (normally `~/.config/hypr`).
 
@@ -78,11 +80,60 @@ Before changing an existing file, Hypr Control creates a uniquely timestamped si
 
 Hypr Control also records the user-owned file contents it loaded. If another application changes one of those files while settings are pending, applying stops instead of silently overwriting the external change.
 
-When installed, the visual display layout editor is deliberately delegated to `nwg-displays`, which owns the generated monitor and workspace files on Omarchy.
+Hypr Control owns the generated `~/.config/hypr/monitors.conf` file. Display
+profiles are stored separately in
+`~/.config/hypr-control/display-profiles.json`, identified by EDID and
+connected dock rather than unstable connector names such as `DP-1`.
+
+Display changes are previewed for 15 seconds. If they are not confirmed, the
+previous monitor configuration is restored. The background display service
+listens to Hyprland's monitor events, debounces multi-output docks, remembers
+new hardware safely with automatic application disabled, and restores layouts
+that have been confirmed in the control center.
+
+## Display automation
+
+The installer enables the user service automatically. Its command-line helper
+can also inspect or change display state:
+
+```bash
+hypr-control-display status
+hypr-control-display apply extend
+hypr-control-display apply external --remember
+hypr-control-display remember --name "Home desk"
+```
+
+### First connection
+
+When a new monitor or dock is connected, Hypr Control records its EDID and dock
+identity without changing the active layout. Open **Displays**, arrange the
+outputs or select a quick mode, and confirm the 15-second preview. The setup is
+then trusted and restored automatically whenever the same hardware reconnects.
+
+The quick modes are:
+
+| Mode | Behavior |
+| --- | --- |
+| Extend | Restores the remembered multi-display arrangement |
+| Mirror | Mirrors every connected output using a shared supported mode when available |
+| External only | Enables external outputs and safely disables the internal panel |
+| Internal only | Enables the internal panel before disabling external outputs |
+
+Automatic application can be disabled independently for any remembered setup
+from the Displays page. Connector changes such as `DP-5` becoming `DP-1` do not
+break matching because profiles use stable display and dock identity.
+
+To disable or re-enable hotplug automation:
+
+```bash
+systemctl --user disable --now io.github.kasperhk.HyprControl.DisplayService.service
+systemctl --user enable --now io.github.kasperhk.HyprControl.DisplayService.service
+```
 
 ## Development
 
-The config parser and write/rollback behavior have no GUI dependency and can be tested with:
+The config parser, display engine, profile matching, layout calculations, and
+write/rollback behavior have no GUI dependency and can be tested with:
 
 ```bash
 make test

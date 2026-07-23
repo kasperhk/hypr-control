@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hypr-control"
-version = "0.2.0"
+version = "0.3.0"
 description = "A native GTK 4 control center for Hyprland on Omarchy"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,6 +26,7 @@ Issues = "https://github.com/kasperhk/hypr-control/issues"
 
 [project.scripts]
 hypr-control-center = "hypr_control_center.app:main"
+hypr-control-display = "hypr_control_center.displays.service:main"
 
 [tool.setuptools.package-data]
 hypr_control_center = ["style.css"]

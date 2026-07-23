@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import difflib
 import json
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -29,6 +29,25 @@ from .config_engine import (
     shortcut_chord,
     transactional_write,
 )
+from .displays.engine import (
+    Display,
+    DisplayLayout,
+    MODE_RE,
+    ProfileStore,
+    capture_layout,
+    discover_displays,
+    layout_for_mode,
+    profile_name,
+    render_monitors_config,
+)
+from .displays.widgets import DisplayCanvas
+from .displays.service import (
+    arm_preview,
+    clear_preview,
+    resume_automation,
+    rollback_expired_preview,
+    suspend_automation,
+)
 
 
 APP_ID = "io.github.kasperhk.HyprControl"
@@ -37,6 +56,8 @@ XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"
 XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")).expanduser()
 HYPR = XDG_CONFIG_HOME / "hypr"
 DEFAULT_HYPR = XDG_DATA_HOME / "omarchy/default/hypr"
+DISPLAY_PROFILES = XDG_CONFIG_HOME / "hypr-control/display-profiles.json"
+MONITORS_CONFIG = HYPR / "monitors.conf"
 
 
 @dataclass
@@ -78,7 +99,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         super().__init__(application=application)
         self.set_title("Hypr Control")
         self.set_default_size(1180, 760)
-        self.set_size_request(760, 560)
+        self.set_size_request(640, 520)
 
         self.loading = True
         self.saving = False
@@ -94,6 +115,17 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.file_snapshots: dict[Path, str | None] = {}
         self.recent_change = "No changes applied in this session"
         self._building_page = "home"
+        self.display_store = ProfileStore(DISPLAY_PROFILES)
+        try:
+            rollback_expired_preview()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        self.display_live: list[Display] = []
+        self.display_mode = "extend"
+        self._display_layout_dirty = False
+        self._display_preview: dict | None = None
+        self._display_preview_timer = 0
+        self._display_preview_dialog = None
         self.connect("close-request", self._close_requested)
 
         self.toast_overlay = Adw.ToastOverlay()
@@ -191,7 +223,18 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self._build_power()
         self._build_shortcuts()
         self._build_advanced()
-        self.sidebar_list.select_row(self.sidebar_list.get_row_at_index(0))
+        initial_page = os.environ.get("HYPR_CONTROL_PAGE", "home")
+        initial_index = next(
+            (
+                index
+                for index, (name, _label, _icon) in enumerate(self.pages)
+                if name == initial_page
+            ),
+            0,
+        )
+        self.sidebar_list.select_row(
+            self.sidebar_list.get_row_at_index(initial_index)
+        )
         self.loading = False
         self._capture_file_snapshots()
         self.refresh_runtime()
@@ -362,6 +405,10 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.toast("Pending changes discarded")
 
     def _close_requested(self, *_args):
+        if self._display_preview:
+            self._finish_display_preview(False)
+            self.toast("Display preview reverted before closing")
+            return True
         if not self._pending_count() and not self.advanced_dirty:
             return False
         dialog = Adw.AlertDialog(
@@ -384,7 +431,13 @@ class HyprControlWindow(Adw.ApplicationWindow):
 
     def _capture_file_snapshots(self):
         paths = {binding.path for binding in self.setting_bindings}
-        paths.update({HYPR / "hypridle.conf", HYPR / "bindings.conf"})
+        paths.update(
+            {
+                HYPR / "hypridle.conf",
+                HYPR / "bindings.conf",
+                MONITORS_CONFIG,
+            }
+        )
         self.file_snapshots.update({path: self._owned_text(path) for path in paths})
 
     def _externally_changed(self, paths):
@@ -450,9 +503,14 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.recent_change_row = self._action_row(desktop, "Recent change", self.recent_change, "document-open-recent-symbolic")
 
         actions = self._group(page, "Quick actions")
-        display = self._action_row(actions, "Display layout", "Arrange monitors, choose modes, and set scaling", "video-display-symbolic")
-        display_button = self._button("Open", "go-next-symbolic", lambda *_: self._launch(["nwg-displays"]))
-        display_button.set_sensitive(shutil.which("nwg-displays") is not None)
+        display = self._action_row(actions, "Display layout", "Arrange outputs and switch remembered setups", "video-display-symbolic")
+        display_button = self._button(
+            "Open",
+            "go-next-symbolic",
+            lambda *_: self.sidebar_list.select_row(
+                next(row for row in self._sidebar_rows() if row.page_name == "displays")
+            ),
+        )
         display.add_suffix(display_button)
         lock = self._action_row(actions, "Lock now", "Secure the session immediately", "system-lock-screen-symbolic")
         lock.add_suffix(self._button("Lock", "system-lock-screen-symbolic", lambda *_: self._launch(["omarchy", "system", "lock"])))
@@ -460,17 +518,469 @@ class HyprControlWindow(Adw.ApplicationWindow):
         reload_row.add_suffix(self._button("Reload", "view-refresh-symbolic", lambda *_: self._run(["hyprctl", "reload"], self._command_toast("Hyprland reloaded"))))
 
     def _build_displays(self):
-        page = self._page("Displays", "Live output details with Omarchy's visual layout editor")
+        self._building_page = "displays"
+        self._add_page_search_terms(
+            "displays",
+            "monitor display layout mirror extend external only internal only profiles automatic dock",
+        )
+        page = self._page(
+            "Displays",
+            "Native layouts, remembered hardware setups, and automatic switching",
+        )
         self.stack.add_named(page, "displays")
-        self.display_group = self._group(page, "Connected displays", "Values come directly from the running compositor")
+
+        modes = self._group(
+            page,
+            "Quick modes",
+            "Changes are previewed for 15 seconds and revert unless confirmed",
+        )
+        mode_box = Gtk.Grid(
+            column_spacing=8,
+            row_spacing=8,
+            column_homogeneous=True,
+        )
+        for index, (mode, label, icon) in enumerate((
+            ("extend", "Extend", "view-dual-symbolic"),
+            ("mirror", "Mirror", "object-flip-horizontal-symbolic"),
+            ("external", "External only", "video-display-symbolic"),
+            ("internal", "Internal only", "computer-symbolic"),
+        )):
+            button = Gtk.Button(hexpand=True)
+            content = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL,
+                spacing=8,
+                halign=Gtk.Align.CENTER,
+            )
+            content.append(Gtk.Image.new_from_icon_name(icon))
+            content.append(Gtk.Label(label=label))
+            button.set_child(content)
+            button.connect(
+                "clicked",
+                lambda _button, selected=mode: self._select_display_mode(
+                    selected
+                ),
+            )
+            button.add_css_class("display-mode-button")
+            mode_box.attach(button, index % 2, index // 2, 1, 1)
+        modes.add(mode_box)
+
+        layout = self._group(
+            page,
+            "Arrangement",
+            "Drag displays to position them; coordinates are normalized automatically",
+        )
+        self.display_canvas = DisplayCanvas(self._display_canvas_changed)
+        layout.add(self.display_canvas)
+        layout_actions = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            spacing=8,
+            halign=Gtk.Align.END,
+        )
+        self.display_apply_button = self._button(
+            "Apply arrangement",
+            "object-select-symbolic",
+            self._apply_canvas_layout,
+            "suggested-action",
+        )
+        self.display_apply_button.set_sensitive(False)
+        layout_actions.append(self.display_apply_button)
+        self.display_remember_button = self._button(
+            "Remember setup",
+            "document-save-symbolic",
+            self._remember_display_setup,
+        )
+        self.display_remember_button.set_sensitive(False)
+        layout_actions.append(self.display_remember_button)
+        layout.add(layout_actions)
+
+        memory = self._group(
+            page,
+            "Setup memory",
+            "Profiles match stable display identity instead of changing connector names",
+        )
+        self.display_profile_row = self._action_row(
+            memory,
+            "Current setup",
+            "Waiting for compositor data",
+            "document-open-recent-symbolic",
+        )
+        self.display_auto_switch = Adw.SwitchRow(
+            title="Apply automatically",
+            subtitle="Restore this setup whenever the same displays reconnect",
+        )
+        self.display_auto_switch.set_sensitive(False)
+        self.display_auto_switch.connect(
+            "notify::active", self._display_auto_switch_changed
+        )
+        memory.add(self.display_auto_switch)
+
+        self.display_group = self._group(
+            page,
+            "Connected displays",
+            "Live values from Hyprland; configure mode, scale, rotation, and position",
+        )
         self.display_rows = []
-        tools = self._group(page, "Layout")
-        row = self._action_row(tools, "Arrange displays", "Drag outputs, select resolutions, refresh rates, transforms, and scaling", "video-display-symbolic")
-        display_button = self._button("Open layout editor", "external-link-symbolic", lambda *_: self._launch(["nwg-displays"]), "suggested-action")
-        display_button.set_sensitive(shutil.which("nwg-displays") is not None)
-        row.add_suffix(display_button)
-        info = self._action_row(tools, "Configuration ownership", "nwg-displays safely maintains monitors.conf and workspace assignments", "dialog-information-symbolic")
-        info.set_sensitive(False)
+
+    def _display_labels(self):
+        return {
+            display.identity: (
+                display.model or display.description or display.name
+            )
+            for display in self.display_live
+        }
+
+    def _display_canvas_changed(self):
+        self._display_layout_dirty = True
+        self.display_mode = "extend"
+        self.display_apply_button.set_sensitive(bool(self.display_live))
+
+    def _select_display_mode(self, mode):
+        if not self.display_live or self._display_preview:
+            return
+        profile = self.display_store.match(self.display_live)
+        remembered = None
+        if profile and mode == "extend":
+            remembered = profile.layouts.get("extend")
+        try:
+            layout = layout_for_mode(self.display_live, mode, remembered)
+        except ValueError as error:
+            self._show_error("The display mode could not be prepared", str(error))
+            return
+        self.display_mode = mode
+        self.display_canvas.set_layout(layout, self._display_labels())
+        self._display_layout_dirty = False
+        self.display_apply_button.set_sensitive(False)
+        self._apply_display_layout(mode, layout)
+
+    def _apply_canvas_layout(self, *_args):
+        if not self.display_live or self._display_preview:
+            return
+        self._apply_display_layout("extend", self.display_canvas.get_layout())
+
+    def _apply_display_layout(self, mode, layout):
+        previous = self._owned_text(MONITORS_CONFIG)
+        conflict = self._externally_changed({MONITORS_CONFIG: ""})
+        if conflict:
+            self._show_error(
+                "Display configuration changed outside Hypr Control",
+                "Refresh Hypr Control before applying so monitors.conf is not overwritten.",
+            )
+            return
+        generated = render_monitors_config(layout)
+        self.display_apply_button.set_sensitive(False)
+        suspend_automation(30)
+        self._apply_transaction(
+            {MONITORS_CONFIG: generated},
+            lambda ok, message: self._display_layout_applied(
+                ok, message, mode, layout, previous, generated
+            ),
+        )
+
+    def _display_layout_applied(
+        self, ok, message, mode, layout, previous, generated
+    ):
+        if not ok:
+            clear_preview()
+            resume_automation()
+            self.display_apply_button.set_sensitive(self._display_layout_dirty)
+            self._show_error("The display change was reverted", message)
+            return
+        self._display_preview = {
+            "mode": mode,
+            "layout": [DisplayLayout(**item.__dict__) for item in layout],
+            "previous": previous,
+            "generated": generated,
+            "remaining": 15,
+        }
+        arm_preview(previous or "monitor = , preferred, auto, 1\n", generated)
+        dialog = Adw.AlertDialog(
+            heading="Keep this display configuration?",
+            body="The previous configuration will be restored automatically in 15 seconds.",
+        )
+        dialog.add_response("revert", "Revert")
+        dialog.add_response("keep", "Keep")
+        dialog.set_default_response("keep")
+        dialog.set_close_response("revert")
+        dialog.set_response_appearance("keep", Adw.ResponseAppearance.SUGGESTED)
+        dialog.connect("response", self._display_preview_response)
+        self._display_preview_dialog = dialog
+        self._display_preview_timer = GLib.timeout_add_seconds(
+            1, self._display_preview_tick
+        )
+        dialog.present(self)
+
+    def _display_preview_tick(self):
+        if not self._display_preview:
+            return GLib.SOURCE_REMOVE
+        self._display_preview["remaining"] -= 1
+        remaining = self._display_preview["remaining"]
+        if remaining <= 0:
+            self._finish_display_preview(False)
+            return GLib.SOURCE_REMOVE
+        if self._display_preview_dialog:
+            self._display_preview_dialog.set_body(
+                f"The previous configuration will be restored automatically in {remaining} seconds."
+            )
+        return GLib.SOURCE_CONTINUE
+
+    def _display_preview_response(self, _dialog, response):
+        if self._display_preview:
+            self._finish_display_preview(response == "keep")
+
+    def _finish_display_preview(self, keep):
+        preview = self._display_preview
+        if not preview:
+            return
+        self._display_preview = None
+        if self._display_preview_timer:
+            GLib.source_remove(self._display_preview_timer)
+            self._display_preview_timer = 0
+        dialog = self._display_preview_dialog
+        self._display_preview_dialog = None
+        if dialog:
+            dialog.close()
+        if keep:
+            clear_preview()
+            profile = self.display_store.remember(
+                self.display_live,
+                preview["mode"],
+                preview["layout"],
+                auto_apply=True,
+            )
+            self.file_snapshots[MONITORS_CONFIG] = preview["generated"]
+            self._display_layout_dirty = False
+            self.display_apply_button.set_sensitive(False)
+            self.display_remember_button.set_sensitive(True)
+            self.display_profile_row.set_subtitle(
+                f"{profile.name} · {profile.default_mode.replace('_', ' ').title()}"
+            )
+            self.loading = True
+            self.display_auto_switch.set_sensitive(True)
+            self.display_auto_switch.set_active(profile.auto_apply)
+            self.loading = False
+            self.recent_change = f"Display setup changed to {profile.name}"
+            self.recent_change_row.set_subtitle(self.recent_change)
+            self.toast(f"Remembered {profile.name}")
+            resume_automation()
+            self.refresh_runtime()
+            return
+
+        previous = preview["previous"]
+        clear_preview()
+        if previous is None:
+            previous = "monitor = , preferred, auto, 1\n"
+        self._apply_transaction(
+            {MONITORS_CONFIG: previous},
+            self._display_layout_reverted,
+        )
+
+    def _display_layout_reverted(self, ok, message):
+        resume_automation()
+        if ok:
+            self.file_snapshots[MONITORS_CONFIG] = self._owned_text(
+                MONITORS_CONFIG
+            )
+            self.toast("Previous display configuration restored")
+            self.refresh_runtime()
+        else:
+            self._show_error(
+                "The previous display configuration could not be restored",
+                message,
+            )
+
+    def _remember_display_setup(self, *_args):
+        if not self.display_live:
+            return
+        layout = self.display_canvas.get_layout() or capture_layout(
+            self.display_live
+        )
+        profile = self.display_store.remember(
+            self.display_live,
+            self.display_mode,
+            layout,
+            auto_apply=self.display_auto_switch.get_active()
+            if self.display_auto_switch.get_sensitive()
+            else True,
+        )
+        self.display_profile_row.set_subtitle(
+            f"{profile.name} · {profile.default_mode.replace('_', ' ').title()}"
+        )
+        self.loading = True
+        self.display_auto_switch.set_sensitive(True)
+        self.display_auto_switch.set_active(profile.auto_apply)
+        self.loading = False
+        self.toast(f"Remembered {profile.name}")
+
+    def _display_auto_switch_changed(self, row, _param):
+        if self.loading or not self.display_live:
+            return
+        profile = self.display_store.match(self.display_live)
+        if not profile:
+            return
+        profile.auto_apply = row.get_active()
+        profile.updated_at = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
+        self.display_store.save()
+        self.toast(
+            "Automatic switching enabled"
+            if profile.auto_apply
+            else "Automatic switching disabled"
+        )
+
+    def _show_display_settings(self, _button, identity):
+        display = next(
+            (item for item in self.display_live if item.identity == identity),
+            None,
+        )
+        if not display:
+            return
+        layout = self.display_canvas.get_layout() or capture_layout(
+            self.display_live
+        )
+        item = next(
+            (candidate for candidate in layout if candidate.identity == identity),
+            None,
+        )
+        if not item:
+            return
+
+        dialog = Adw.Window(
+            transient_for=self,
+            modal=True,
+            title=f"Configure {display.model or display.name}",
+            default_width=560,
+            default_height=580,
+        )
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(
+            Adw.WindowTitle(
+                title=display.model or display.name,
+                subtitle=display.description,
+            )
+        )
+        cancel = Gtk.Button(label="Cancel")
+        cancel.connect("clicked", lambda *_: dialog.close())
+        header.pack_start(cancel)
+        apply_button = Gtk.Button(label="Apply")
+        apply_button.add_css_class("suggested-action")
+        header.pack_end(apply_button)
+        toolbar.add_top_bar(header)
+        page = Adw.PreferencesPage()
+        toolbar.set_content(page)
+        dialog.set_content(toolbar)
+
+        output = Adw.PreferencesGroup(
+            title="Output",
+            description="Changes are previewed with automatic rollback",
+        )
+        page.add(output)
+        enabled = Adw.SwitchRow(
+            title="Enabled",
+            subtitle="At least one display must remain enabled",
+        )
+        enabled.set_active(item.enabled)
+        output.add(enabled)
+
+        mode_values = []
+        for raw in display.available_modes:
+            match = MODE_RE.search(raw)
+            if match:
+                value = (
+                    int(match["width"]),
+                    int(match["height"]),
+                    float(match["refresh"]),
+                )
+                if value not in mode_values:
+                    mode_values.append(value)
+        current_mode = (item.width, item.height, item.refresh)
+        if not mode_values:
+            mode_values.append(current_mode)
+        selected_mode = min(
+            range(len(mode_values)),
+            key=lambda index: (
+                abs(mode_values[index][0] - item.width)
+                + abs(mode_values[index][1] - item.height)
+                + abs(mode_values[index][2] - item.refresh)
+            ),
+        )
+        mode_row = Adw.ComboRow(
+            title="Resolution and refresh rate",
+            model=Gtk.StringList.new(
+                [
+                    f"{width} × {height} @ {refresh:.2f} Hz"
+                    for width, height, refresh in mode_values
+                ]
+            ),
+        )
+        mode_row.set_selected(selected_mode)
+        output.add(mode_row)
+        scale = Adw.SpinRow.new_with_range(0.5, 4, 0.05)
+        scale.set_title("Scale")
+        scale.set_subtitle("Logical size multiplier")
+        scale.set_digits(2)
+        scale.set_value(item.scale)
+        output.add(scale)
+        rotations = ["Normal", "90°", "180°", "270°"]
+        rotation_values = [0, 1, 2, 3]
+        rotation = Adw.ComboRow(
+            title="Rotation", model=Gtk.StringList.new(rotations)
+        )
+        rotation.set_selected(
+            rotation_values.index(item.transform)
+            if item.transform in rotation_values
+            else 0
+        )
+        output.add(rotation)
+        ten_bit = Adw.SwitchRow(
+            title="10-bit output",
+            subtitle="May affect screen capture compatibility",
+        )
+        ten_bit.set_active(item.ten_bit)
+        output.add(ten_bit)
+
+        position = Adw.PreferencesGroup(
+            title="Position",
+            description="Coordinates use scaled logical pixels",
+        )
+        page.add(position)
+        x_row = Adw.SpinRow.new_with_range(-20000, 20000, 10)
+        x_row.set_title("X")
+        x_row.set_value(item.x)
+        position.add(x_row)
+        y_row = Adw.SpinRow.new_with_range(-20000, 20000, 10)
+        y_row.set_title("Y")
+        y_row.set_value(item.y)
+        position.add(y_row)
+
+        def apply_settings(*_args):
+            if not enabled.get_active() and sum(
+                candidate.enabled
+                for candidate in layout
+                if candidate.identity != identity
+            ) == 0:
+                self.toast("At least one display must remain enabled")
+                return
+            width, height, refresh = mode_values[mode_row.get_selected()]
+            item.enabled = enabled.get_active()
+            item.width = width
+            item.height = height
+            item.refresh = refresh
+            item.scale = scale.get_value()
+            item.transform = rotation_values[rotation.get_selected()]
+            item.ten_bit = ten_bit.get_active()
+            item.x = int(x_row.get_value())
+            item.y = int(y_row.get_value())
+            item.mirror_of = ""
+            item.mirror_identity = ""
+            dialog.close()
+            self.display_mode = "extend"
+            self.display_canvas.set_layout(layout, self._display_labels())
+            self._apply_display_layout("extend", self.display_canvas.get_layout())
+
+        apply_button.connect("clicked", apply_settings)
+        dialog.present()
 
     def _build_appearance(self):
         page = self._page("Appearance", "Windows, layout, themes, fonts, and wallpaper")
@@ -1179,6 +1689,45 @@ class HyprControlWindow(Adw.ApplicationWindow):
         device_count = sum(len(devices.get(kind, [])) for kind in ("keyboards", "mice", "touchpads", "tablets"))
         self.status_input.set_subtitle(f"{device_count} connected device{'s' if device_count != 1 else ''}")
 
+        try:
+            self.display_live = discover_displays(monitors)
+        except (OSError, ValueError, json.JSONDecodeError):
+            self.display_live = []
+        self.display_store.load()
+        profile = self.display_store.match(self.display_live)
+        if self.display_live and not self._display_layout_dirty and not self._display_preview:
+            self.file_snapshots[MONITORS_CONFIG] = self._owned_text(
+                MONITORS_CONFIG
+            )
+            if profile:
+                resolved = profile.resolved_layout(self.display_live)
+                canvas_layout = resolved or capture_layout(self.display_live)
+                self.display_mode = profile.default_mode
+            else:
+                canvas_layout = capture_layout(self.display_live)
+                self.display_mode = "extend"
+            self.display_canvas.set_layout(canvas_layout, self._display_labels())
+        self.display_remember_button.set_sensitive(bool(self.display_live))
+        if profile:
+            self.display_profile_row.set_subtitle(
+                f"{profile.name} · {profile.default_mode.replace('_', ' ').title()}"
+            )
+            self.loading = True
+            self.display_auto_switch.set_sensitive(True)
+            self.display_auto_switch.set_active(profile.auto_apply)
+            self.loading = False
+        elif self.display_live:
+            self.display_profile_row.set_subtitle(
+                f"New setup · {profile_name(self.display_live)}"
+            )
+            self.loading = True
+            self.display_auto_switch.set_active(False)
+            self.display_auto_switch.set_sensitive(False)
+            self.loading = False
+        else:
+            self.display_profile_row.set_subtitle("No compositor data")
+            self.display_auto_switch.set_sensitive(False)
+
         for row in self.display_rows:
             self.display_group.remove(row)
         self.display_rows.clear()
@@ -1186,19 +1735,28 @@ class HyprControlWindow(Adw.ApplicationWindow):
             row = Adw.ActionRow(title="No outputs reported", subtitle="Hyprland may not be available")
             self.display_group.add(row)
             self.display_rows.append(row)
-        for monitor in monitors:
-            title = f"{monitor['description']}"
-            subtitle = f"{monitor['name']} · {monitor['width']}×{monitor['height']} @ {monitor['refreshRate']:.2f} Hz · scale {monitor['scale']:.2g}×"
+        for display in self.display_live:
+            title = display.description
+            subtitle = f"{display.name} · {display.width}×{display.height} @ {display.refresh:.2f} Hz · scale {display.scale:.2g}×"
             row = Adw.ActionRow(title=title, subtitle=subtitle)
             row.add_prefix(Gtk.Image.new_from_icon_name("video-display-symbolic"))
             badges = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            if monitor.get("focused"):
+            if display.focused:
                 badge = Gtk.Label(label="Active")
                 badge.add_css_class("status-badge")
                 badges.append(badge)
-            state = Gtk.Label(label="On" if monitor.get("dpmsStatus") else "Off")
+            state = Gtk.Label(label="Internal" if display.internal else "External")
             state.add_css_class("status-badge")
             badges.append(state)
+            configure = Gtk.Button(
+                icon_name="emblem-system-symbolic",
+                tooltip_text=f"Configure {display.name}",
+                valign=Gtk.Align.CENTER,
+            )
+            configure.connect(
+                "clicked", self._show_display_settings, display.identity
+            )
+            badges.append(configure)
             row.add_suffix(badges)
             self.display_group.add(row)
             self.display_rows.append(row)
