@@ -72,7 +72,11 @@ git pull --ff-only
 ./install.sh
 ```
 
-The installer replaces only Hypr Control's files under the selected user prefix. It does not modify your Hyprland configuration.
+The installer replaces Hypr Control's files under the selected user prefix. On
+Hyprland's native-Lua configuration it also creates isolated Hypr Control
+modules, adds idempotent `require` lines to `~/.config/hypr/hyprland.lua`, and
+backs up that file before the first integration change. Existing managed
+modules and personal settings are preserved during reinstalls.
 
 ## Safety model
 
@@ -80,7 +84,7 @@ Before changing an existing file, Hypr Control creates a uniquely timestamped si
 
 Hypr Control also records the user-owned file contents it loaded. If another application changes one of those files while settings are pending, applying stops instead of silently overwriting the external change.
 
-Hypr Control owns the generated `~/.config/hypr/monitors.conf` file. Display
+Hypr Control owns the generated `~/.config/hypr/hypr-control-monitors.lua` file. Display
 profiles are stored separately in
 `~/.config/hypr-control/display-profiles.json`, identified by EDID and
 connected dock rather than unstable connector names such as `DP-1`.

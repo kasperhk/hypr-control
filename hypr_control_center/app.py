@@ -19,12 +19,12 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from .config_engine import (
     backup_history,
+    get_lua_value,
     get_value,
-    idle_timeouts,
-    listener_timeout,
+    lua_scalar,
     parse_bindings,
-    remove_listener,
-    set_listener_timeout,
+    render_lua_bindings,
+    set_lua_value,
     set_value,
     shortcut_chord,
     transactional_write,
@@ -54,10 +54,15 @@ APP_ID = "io.github.kasperhk.HyprControl"
 ROOT = Path(__file__).resolve().parent
 XDG_CONFIG_HOME = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")).expanduser()
 XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")).expanduser()
+OMARCHY_PATH = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy")).expanduser()
 HYPR = XDG_CONFIG_HOME / "hypr"
-DEFAULT_HYPR = XDG_DATA_HOME / "omarchy/default/hypr"
+DEFAULT_HYPR = OMARCHY_PATH / "default/hypr"
 DISPLAY_PROFILES = XDG_CONFIG_HOME / "hypr-control/display-profiles.json"
-MONITORS_CONFIG = HYPR / "monitors.conf"
+HYPR_CONTROL_CONFIG = HYPR / "hypr-control.lua"
+MONITORS_CONFIG = HYPR / "hypr-control-monitors.lua"
+BINDINGS_CONFIG = HYPR / "hypr-control-bindings.lua"
+BINDINGS_STORE = XDG_CONFIG_HOME / "hypr-control/bindings.conf"
+SHELL_CONFIG = XDG_CONFIG_HOME / "omarchy/shell.json"
 
 
 @dataclass
@@ -108,10 +113,10 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.shortcut_additions: list[str] = []
         self.shortcut_removals: set[str] = set()
         self.advanced_dirty = False
-        self.advanced_current = "hyprland.conf"
+        self.advanced_current = "hyprland.lua"
         self._advanced_switching = False
         self._idle_dirty = False
-        self._idle_original: tuple[float, float, bool, float] | None = None
+        self._idle_original: tuple[float, float] | None = None
         self.file_snapshots: dict[Path, str | None] = {}
         self.recent_change = "No changes applied in this session"
         self._building_page = "home"
@@ -318,7 +323,10 @@ class HyprControlWindow(Adw.ApplicationWindow):
         return False
 
     def _resolved(self, path: Path, block: tuple[str, ...], key: str, fallback: str) -> str:
-        value = get_value(self._config_text(path), block, key)
+        if path.suffix == ".lua":
+            value = get_lua_value(self._config_text(path), block, key)
+        else:
+            value = get_value(self._config_text(path), block, key)
         if value is not None:
             return value
         return fallback
@@ -389,11 +397,9 @@ class HyprControlWindow(Adw.ApplicationWindow):
             self._set_binding_widget(binding, binding.original)
             binding.widget.remove_css_class("pending-setting")
         if self._idle_original:
-            saver, lock, suspend, delay = self._idle_original
+            saver, lock = self._idle_original
             self.saver_delay.set_value(saver)
             self.lock_delay.set_value(lock)
-            self.suspend_idle.set_active(suspend)
-            self.suspend_delay.set_value(delay)
         self.loading = False
         self.dirty_bindings.clear()
         self._idle_dirty = False
@@ -433,8 +439,9 @@ class HyprControlWindow(Adw.ApplicationWindow):
         paths = {binding.path for binding in self.setting_bindings}
         paths.update(
             {
-                HYPR / "hypridle.conf",
-                HYPR / "bindings.conf",
+                SHELL_CONFIG,
+                BINDINGS_STORE,
+                BINDINGS_CONFIG,
                 MONITORS_CONFIG,
             }
         )
@@ -663,7 +670,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         if conflict:
             self._show_error(
                 "Display configuration changed outside Hypr Control",
-                "Refresh Hypr Control before applying so monitors.conf is not overwritten.",
+                "Refresh Hypr Control before applying so its native display configuration is not overwritten.",
             )
             return
         generated = render_monitors_config(layout)
@@ -692,7 +699,11 @@ class HyprControlWindow(Adw.ApplicationWindow):
             "generated": generated,
             "remaining": 15,
         }
-        arm_preview(previous or "monitor = , preferred, auto, 1\n", generated)
+        arm_preview(
+            previous
+            or 'hl.monitor({ output = "", mode = "preferred", position = "auto", scale = 1 })\n',
+            generated,
+        )
         dialog = Adw.AlertDialog(
             heading="Keep this display configuration?",
             body="The previous configuration will be restored automatically in 15 seconds.",
@@ -768,7 +779,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         previous = preview["previous"]
         clear_preview()
         if previous is None:
-            previous = "monitor = , preferred, auto, 1\n"
+            previous = 'hl.monitor({ output = "", mode = "preferred", position = "auto", scale = 1 })\n'
         self._apply_transaction(
             {MONITORS_CONFIG: previous},
             self._display_layout_reverted,
@@ -1010,7 +1021,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         font_button.set_sensitive(bool(self.font_names))
         self.font_combo.add_suffix(font_button)
 
-        look = HYPR / "looknfeel.conf"
+        look = HYPR_CONTROL_CONFIG
         geometry = self._group(page, "Window geometry")
         presets = self._action_row(geometry, "Presets", "Apply a coordinated starting point", "applications-graphics-symbolic")
         preset_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1050,7 +1061,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
     def _build_input(self):
         page = self._page("Keyboard & Mouse", "Keyboard layout, repeat behavior, pointer, and touchpad")
         self.stack.add_named(page, "input")
-        path = HYPR / "input.conf"
+        path = HYPR_CONTROL_CONFIG
         keyboard = self._group(page, "Keyboard")
         self._entry(keyboard, "Layout codes", path, ("input",), "kb_layout", "us")
         self._entry(keyboard, "Variant", path, ("input",), "kb_variant", "")
@@ -1079,11 +1090,14 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.suspend_toggle = self._runtime_switch(services, "Suspend in system menu", "Show suspend as a session action", "preferences-system-power-symbolic", self._suspend_enabled, ["omarchy", "toggle", "suspend"])
         self.nightlight_toggle = self._runtime_switch(services, "Night light", "Reduce blue light with a warmer display", "weather-clear-night-symbolic", self._nightlight_enabled, ["omarchy", "toggle", "nightlight"])
 
-        idle = self._group(page, "Idle timeline", "Each point is measured from the last keyboard or pointer activity")
-        idle_text = self._config_text(HYPR / "hypridle.conf")
-        saver_seconds = listener_timeout(idle_text, "omarchy-launch-screensaver") or 120
-        lock_seconds = listener_timeout(idle_text, "omarchy-system-lock") or 122
-        suspend_seconds = listener_timeout(idle_text, "systemctl suspend")
+        idle = self._group(page, "Idle timeline", "Managed by Omarchy Shell; each point is measured from the last input")
+        try:
+            shell_config = json.loads(self._config_text(SHELL_CONFIG) or "{}")
+        except json.JSONDecodeError:
+            shell_config = {}
+        idle_config = shell_config.get("idle", {})
+        saver_seconds = int(idle_config.get("screensaver", 150))
+        lock_seconds = int(idle_config.get("lock", 300))
         self.saver_delay = Adw.SpinRow.new_with_range(1, 120, 1)
         self.saver_delay.set_title("Start screensaver after")
         self.saver_delay.set_subtitle("Minutes with no input")
@@ -1094,19 +1108,8 @@ class HyprControlWindow(Adw.ApplicationWindow):
         self.lock_delay.set_subtitle("Additional minutes; 0 locks immediately")
         self.lock_delay.set_value(max(0, round((lock_seconds - saver_seconds) / 60)))
         idle.add(self.lock_delay)
-        self.suspend_idle = Adw.SwitchRow(title="Suspend automatically", subtitle="Put the computer to sleep after extended inactivity")
-        self.suspend_idle.set_active(suspend_seconds is not None)
-        idle.add(self.suspend_idle)
-        self.suspend_delay = Adw.SpinRow.new_with_range(5, 240, 5)
-        self.suspend_delay.set_title("Suspend after")
-        self.suspend_delay.set_subtitle("Total minutes with no input")
-        self.suspend_delay.set_value(max(5, round((suspend_seconds or 1800) / 60)))
-        self.suspend_delay.set_sensitive(self.suspend_idle.get_active())
-        idle.add(self.suspend_delay)
-        for widget in (self.saver_delay, self.lock_delay, self.suspend_idle, self.suspend_delay):
-            signal = "notify::active" if isinstance(widget, Adw.SwitchRow) else "notify::value"
-            widget.connect(signal, self._mark_idle_dirty)
-        self.suspend_idle.connect("notify::active", lambda row, *_: self.suspend_delay.set_sensitive(row.get_active()))
+        for widget in (self.saver_delay, self.lock_delay):
+            widget.connect("notify::value", self._mark_idle_dirty)
         self.idle_timeline = self._action_row(idle, "Current sequence", "", "appointment-soon-symbolic")
         self.idle_timeline.set_sensitive(False)
         self.idle_timeline.add_css_class("timeline-row")
@@ -1156,16 +1159,12 @@ class HyprControlWindow(Adw.ApplicationWindow):
         return (
             self.saver_delay.get_value(),
             self.lock_delay.get_value(),
-            self.suspend_idle.get_active(),
-            self.suspend_delay.get_value(),
         )
 
     def _update_idle_timeline(self):
         saver = int(self.saver_delay.get_value())
         lock = saver + int(self.lock_delay.get_value())
         stages = [f"{saver} min  Screensaver", f"{lock} min  Lock"]
-        if self.suspend_idle.get_active():
-            stages.append(f"{int(self.suspend_delay.get_value())} min  Suspend")
         self.idle_timeline.set_subtitle("   →   ".join(stages))
 
     def _build_shortcuts(self):
@@ -1174,7 +1173,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         actions = self._group(page, "Manage")
         add = self._action_row(actions, "Add shortcut", "Create a named command binding", "list-add-symbolic")
         add.add_suffix(self._button("Add", "list-add-symbolic", self._show_add_shortcut, "suggested-action"))
-        note = self._action_row(actions, "Default shortcuts", "Omarchy defaults remain protected; this page edits only bindings.conf", "dialog-information-symbolic")
+        note = self._action_row(actions, "Default shortcuts", "Omarchy defaults remain protected; this page edits only Hypr Control shortcuts", "dialog-information-symbolic")
         note.set_sensitive(False)
         self.shortcut_group = self._group(page, "Your shortcuts")
         self.shortcut_rows = []
@@ -1184,7 +1183,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
         for row in self.shortcut_rows:
             self.shortcut_group.remove(row)
         self.shortcut_rows.clear()
-        text = self._config_text(HYPR / "bindings.conf")
+        text = self._config_text(BINDINGS_STORE)
         bindings = [item for item in parse_bindings(text) if item["line"] not in self.shortcut_removals]
         for line in self.shortcut_additions:
             bindings.extend(parse_bindings(line))
@@ -1283,7 +1282,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
                 return
             mods = modifiers.get_text().strip().upper()
             pressed = key.get_text().strip().upper()
-            conflicts = parse_bindings(self._config_text(HYPR / "bindings.conf"))
+            conflicts = parse_bindings(self._config_text(BINDINGS_STORE))
             chord = shortcut_chord(mods, pressed)
             if any(shortcut_chord(str(item["mods"]), str(item["key"])) == chord for item in conflicts):
                 self.toast("That combination already exists in your personal shortcuts")
@@ -1338,6 +1337,19 @@ class HyprControlWindow(Adw.ApplicationWindow):
                 self.shortcut_additions.pop(index - 1)
         else:
             self.shortcut_removals.add(line)
+            parsed = parse_bindings(line)
+            store_lines = self._config_text(BINDINGS_STORE).splitlines()
+            if parsed and line in store_lines:
+                index = store_lines.index(line)
+                if index > 0 and store_lines[index - 1].lstrip().startswith("unbind ="):
+                    unbind = store_lines[index - 1]
+                    payload = unbind.split("=", 1)[1]
+                    parts = [part.strip() for part in payload.split(",", 1)]
+                    item = parsed[0]
+                    if len(parts) == 2 and shortcut_chord(parts[0], parts[1]) == shortcut_chord(
+                        str(item["mods"]), str(item["key"])
+                    ):
+                        self.shortcut_removals.add(unbind)
         self._populate_shortcuts()
         self._update_pending_bar()
 
@@ -1353,12 +1365,17 @@ class HyprControlWindow(Adw.ApplicationWindow):
         heading = Gtk.Label(label="Raw configuration", xalign=0)
         heading.add_css_class("title-2")
         page.append(heading)
-        description = Gtk.Label(label="Edit any user-owned Hyprland file. A backup is created before every save.", xalign=0)
+        description = Gtk.Label(label="Edit any user-owned Hyprland Lua or legacy config file. A backup is created before every save.", xalign=0)
         description.add_css_class("dim-label")
         page.append(description)
 
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.advanced_files = sorted(path.name for path in HYPR.glob("*.conf") if ".bak." not in path.name)
+        self.advanced_files = sorted(
+            path.name
+            for pattern in ("*.lua", "*.conf")
+            for path in HYPR.glob(pattern)
+            if ".bak." not in path.name and ".omarchy-upgrade-" not in path.name
+        )
         if not self.advanced_files:
             self.advanced_files = ["hyprland.conf"]
         if self.advanced_current not in self.advanced_files:
@@ -1506,34 +1523,37 @@ class HyprControlWindow(Adw.ApplicationWindow):
             binding = self.setting_bindings[index]
             if binding.path not in changed:
                 changed[binding.path] = self._config_text(binding.path)
-            changed[binding.path] = set_value(changed[binding.path], binding.block, binding.key, binding.serialize())
+            if binding.path.suffix == ".lua":
+                changed[binding.path] = set_lua_value(
+                    changed[binding.path],
+                    binding.block,
+                    binding.key,
+                    lua_scalar(binding.serialize()),
+                )
+            else:
+                changed[binding.path] = set_value(
+                    changed[binding.path], binding.block, binding.key, binding.serialize()
+                )
 
         if getattr(self, "_idle_dirty", False):
-            path = HYPR / "hypridle.conf"
-            text = self._config_text(path)
             try:
-                saver_seconds, lock_seconds, suspend_seconds = idle_timeouts(
-                    self.saver_delay.get_value(),
-                    self.lock_delay.get_value(),
-                    self.suspend_delay.get_value() if self.suspend_idle.get_active() else None,
-                )
-            except ValueError:
-                self._show_error("Suspend must come after lock", "Choose a suspend time later than the lock point in the idle timeline.")
+                shell_config = json.loads(self._config_text(SHELL_CONFIG) or "{}")
+            except json.JSONDecodeError:
+                self._show_error("Omarchy Shell configuration is invalid", "Fix shell.json before changing idle timing.")
                 return
-            text = set_listener_timeout(text, "omarchy-launch-screensaver", saver_seconds)
-            text = set_listener_timeout(text, "omarchy-system-lock", lock_seconds)
-            if self.suspend_idle.get_active():
-                text = set_listener_timeout(text, "systemctl suspend", suspend_seconds or 0, "systemctl suspend")
-            else:
-                text = remove_listener(text, "systemctl suspend")
-            changed[path] = text
+            idle_config = shell_config.setdefault("idle", {})
+            saver_seconds = round(self.saver_delay.get_value() * 60)
+            idle_config["screensaver"] = saver_seconds
+            idle_config["lock"] = saver_seconds + round(self.lock_delay.get_value() * 60)
+            changed[SHELL_CONFIG] = json.dumps(shell_config, indent=2) + "\n"
 
         if self.shortcut_additions or self.shortcut_removals:
-            path = HYPR / "bindings.conf"
-            lines = [line for line in self._config_text(path).splitlines() if line not in self.shortcut_removals]
+            lines = [line for line in self._config_text(BINDINGS_STORE).splitlines() if line not in self.shortcut_removals]
             if self.shortcut_additions:
                 lines.extend(["", "# Added by Hypr Control", *self.shortcut_additions])
-            changed[path] = "\n".join(lines).rstrip() + "\n"
+            store_text = "\n".join(lines).rstrip() + "\n"
+            changed[BINDINGS_STORE] = store_text
+            changed[BINDINGS_CONFIG] = render_lua_bindings(store_text)
 
         if not changed:
             return
@@ -1570,16 +1590,13 @@ class HyprControlWindow(Adw.ApplicationWindow):
             self._show_error("The changes were reverted", message)
 
     def _validate_changes(self, names: set[str]):
-        hypr_files = names - {"hypridle.conf", "hyprsunset.conf", "hyprlock.conf"}
+        hypr_files = names - {"shell.json", "bindings.conf", "hyprsunset.conf", "hyprlock.conf"}
         ok, message = True, ""
         if hypr_files:
             reload_result = subprocess.run(["hyprctl", "reload"], capture_output=True, text=True, timeout=15)
             errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, timeout=15)
             message = (reload_result.stderr + errors.stdout + errors.stderr).strip()
             ok = reload_result.returncode == 0 and errors.returncode == 0 and not errors.stdout.strip()
-        if ok and "hypridle.conf" in names:
-            result = subprocess.run(["omarchy", "restart", "hypridle"], capture_output=True, text=True, timeout=30)
-            ok, message = result.returncode == 0, (result.stdout + result.stderr).strip()
         if ok and "hyprsunset.conf" in names:
             result = subprocess.run(["omarchy", "restart", "hyprsunset"], capture_output=True, text=True, timeout=30)
             ok, message = result.returncode == 0, (result.stdout + result.stderr).strip()
@@ -1588,7 +1605,7 @@ class HyprControlWindow(Adw.ApplicationWindow):
     def _apply_transaction(self, changes: dict[Path, str], callback):
         def work():
             names = {path.name for path in changes}
-            hypr_files = names - {"hypridle.conf", "hyprsunset.conf", "hyprlock.conf"}
+            hypr_files = names - {"shell.json", "bindings.conf", "hyprsunset.conf", "hyprlock.conf"}
             try:
                 ok, message, _backups = transactional_write(changes, lambda: self._validate_changes(names))
             except (OSError, subprocess.TimeoutExpired) as error:
@@ -1596,8 +1613,6 @@ class HyprControlWindow(Adw.ApplicationWindow):
             if not ok:
                 if hypr_files:
                     subprocess.run(["hyprctl", "reload"], capture_output=True)
-                if "hypridle.conf" in names:
-                    subprocess.run(["omarchy", "restart", "hypridle"], capture_output=True)
                 if "hyprsunset.conf" in names:
                     subprocess.run(["omarchy", "restart", "hyprsunset"], capture_output=True)
             GLib.idle_add(callback, ok, message or "Hyprland rejected the configuration")
@@ -1636,7 +1651,11 @@ class HyprControlWindow(Adw.ApplicationWindow):
         threading.Thread(target=work, daemon=True).start()
 
     def _idle_enabled(self):
-        return subprocess.run(["pgrep", "-x", "hypridle"], capture_output=True).returncode == 0
+        try:
+            status = json.loads(self._output(["omarchy", "toggle", "idle", "--status"]) or "{}")
+        except json.JSONDecodeError:
+            return True
+        return not bool(status.get("enabled", False))
 
     def _nightlight_process(self):
         return subprocess.run(["pgrep", "-x", "hyprsunset"], capture_output=True).returncode == 0
@@ -1701,8 +1720,13 @@ class HyprControlWindow(Adw.ApplicationWindow):
             )
             if profile:
                 resolved = profile.resolved_layout(self.display_live)
-                canvas_layout = resolved or capture_layout(self.display_live)
                 self.display_mode = profile.default_mode
+                if self.display_mode == "extend":
+                    canvas_layout = layout_for_mode(
+                        self.display_live, "extend", resolved
+                    )
+                else:
+                    canvas_layout = resolved or capture_layout(self.display_live)
             else:
                 canvas_layout = capture_layout(self.display_live)
                 self.display_mode = "extend"

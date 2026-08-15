@@ -6,13 +6,16 @@ import unittest
 from hypr_control_center.config_engine import (
     atomic_write,
     backup_history,
+    get_lua_value,
     get_value,
     idle_timeouts,
     listener_timeout,
     parse_bindings,
     remove_listener,
+    render_lua_bindings,
     restore_backup,
     set_listener_timeout,
+    set_lua_value,
     set_value,
     shortcut_chord,
     transactional_write,
@@ -31,6 +34,19 @@ decoration {
 }
 """
 
+LUA_SAMPLE = """-- Managed values
+hl.config({
+  general = {
+    layout = "scrolling", -- existing comment
+  },
+  decoration = {
+    blur = {
+      enabled = true,
+    },
+  },
+})
+"""
+
 
 class ConfigEngineTests(unittest.TestCase):
     def test_reads_nested_values(self):
@@ -45,6 +61,22 @@ class ConfigEngineTests(unittest.TestCase):
     def test_inserts_nested_value(self):
         changed = set_value(SAMPLE, ("decoration", "blur"), "passes", "3")
         self.assertEqual(get_value(changed, ("decoration", "blur"), "passes"), "3")
+
+    def test_lua_setting_round_trip(self):
+        self.assertEqual(get_lua_value(LUA_SAMPLE, ("general",), "layout"), "scrolling")
+        changed = set_lua_value(LUA_SAMPLE, ("general",), "layout", '"dwindle"')
+        changed = set_lua_value(changed, ("decoration", "blur"), "passes", "3")
+        self.assertEqual(get_lua_value(changed, ("general",), "layout"), "dwindle")
+        self.assertEqual(get_lua_value(changed, ("decoration", "blur"), "passes"), "3")
+        self.assertIn("-- existing comment", changed)
+
+    def test_renders_managed_bindings_as_lua(self):
+        text = """unbind = SUPER SHIFT, X
+bindd = SUPER SHIFT, X, Launch thing, exec, app --value=a,b
+"""
+        rendered = render_lua_bindings(text)
+        self.assertIn('hl.unbind("SUPER + SHIFT + X")', rendered)
+        self.assertIn('o.bind("SUPER + SHIFT + X", "Launch thing", "app --value=a,b")', rendered)
 
     def test_listener_round_trip(self):
         idle = """listener {

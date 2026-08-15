@@ -30,7 +30,7 @@ CONFIG_HOME = _xdg_path("XDG_CONFIG_HOME", Path.home() / ".config")
 STATE_HOME = _xdg_path("XDG_STATE_HOME", Path.home() / ".local/state")
 PROFILES_PATH = CONFIG_HOME / "hypr-control/display-profiles.json"
 STATE_PATH = STATE_HOME / "hypr-control/display-runtime.json"
-MONITORS_PATH = CONFIG_HOME / "hypr/monitors.conf"
+MONITORS_PATH = CONFIG_HOME / "hypr/hypr-control-monitors.lua"
 PREVIEW_PATH = STATE_HOME / "hypr-control/display-preview.json"
 
 
@@ -96,7 +96,7 @@ def rollback_expired_preview() -> bool:
         clear_preview()
         resume_automation()
         return False
-    previous = preview.get("previous") or "monitor = , preferred, auto, 1\n"
+    previous = preview.get("previous") or 'hl.monitor({ output = "", mode = "preferred", position = "auto", scale = 1 })\n'
     try:
         ok, _message, _backups = transactional_write(
             {MONITORS_PATH: previous}, validate_hyprland

@@ -75,6 +75,14 @@ class DisplayEngineTests(unittest.TestCase):
         layout = layout_for_mode([self.internal], "external")
         self.assertTrue(layout[0].enabled)
 
+    def test_extend_rejects_remembered_layout_with_disabled_output(self):
+        remembered = layout_for_mode(self.displays, "internal")
+        layout = layout_for_mode(self.displays, "extend", remembered)
+        states = {item.identity: item.enabled for item in layout}
+        positions = {item.identity: (item.x, item.y) for item in layout}
+        self.assertEqual(states, {"internal": True, "dell": True})
+        self.assertEqual(positions, {"internal": (0, 0), "dell": (1440, 0)})
+
     def test_mirror_chooses_best_shared_mode(self):
         first = display(
             "DP-1",
@@ -135,10 +143,10 @@ class DisplayEngineTests(unittest.TestCase):
         text = render_monitors_config(
             layout, generated_at=datetime(2026, 7, 23, tzinfo=timezone.utc)
         )
-        self.assertIn("transform, 1", text)
-        self.assertIn("bitdepth, 10", text)
-        self.assertIn("mirror, DP-5", text)
-        self.assertIn("monitor = , preferred, auto, 1", text)
+        self.assertIn("transform = 1", text)
+        self.assertIn("bitdepth = 10", text)
+        self.assertIn('mirror = "DP-5"', text)
+        self.assertIn('output = ""', text)
 
     def test_profile_matches_after_connector_name_changes(self):
         with tempfile.TemporaryDirectory() as directory:
